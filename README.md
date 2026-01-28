@@ -91,7 +91,7 @@ Fileshed gives your LLM a persistent workspace. It provides:
 > ✅ Done! [📥 Download countries_density.zip]
 
 <p align="center">
-  <img src="assets/demo_workflow.png" alt="Demo workflow" width="800">
+  <img src="assets/Fileshed_dl_to_sqlite_to_archive.png" alt="Demo workflow" width="800">
 </p>
 
 ---
