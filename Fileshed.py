@@ -7155,8 +7155,8 @@ class Tools:
         # List of available howtos
         available_howtos = list(self._core.HOWTO_GUIDES.keys()) + ["full"]
         
-        # No argument: return quick help + howto list
-        if howto is None:
+        # No argument (or empty string): return quick help + howto list
+        if not howto:
             help_text = """# 🛖 Fileshed - Quick Reference
 
 ## 🔥 WORKFLOWS (choose one!)
