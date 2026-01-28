@@ -2,7 +2,7 @@
 title: Fileshed
 description: Persistent file storage with group collaboration. FIRST: Run shed_help() for quick reference or shed_help(howto="...") for guides: download, csv_to_sqlite, upload, share, edit, commands, network, paths, full. Config: shed_parameters().
 author: Fade78 (with Claude Opus 4.5)
-version: 1.0.0
+version: 1.0.1
 license: MIT
 required_open_webui_version: 0.4.0
 
@@ -65,6 +65,7 @@ import json
 import mimetypes
 import os
 import re
+import resource
 import shutil
 import sqlite3
 import subprocess
@@ -175,8 +176,8 @@ WHITELIST_READWRITE = WHITELIST_READONLY | {
     "sum",
     # Additional encoding
     "uuencode", "uudecode",
-    # File modification
-    "touch", "mkdir", "rm", "rmdir", "mv", "cp", "ln", "truncate", "mktemp",
+    # File modification (ln removed - security risk with hard/soft links)
+    "touch", "mkdir", "rm", "rmdir", "mv", "cp", "truncate", "mktemp",
     "install", "shred", "rename",
     # Permissions
     "chmod",
@@ -308,6 +309,23 @@ FIND_EXEC_OPTIONS = {"-exec", "-execdir", "-ok", "-okdir"}
 # awk patterns that can execute commands (security risk)
 # system() executes shell commands, getline can pipe from commands
 AWK_DANGEROUS_PATTERNS = re.compile(r'\bsystem\s*\(|\|\s*getline|\bgetline\s*<')
+
+# ffmpeg options that can be used for data exfiltration or other dangerous operations
+# in "safe" network mode. These are blocked unless network_mode="all"
+FFMPEG_DANGEROUS_OPTIONS = {
+    # Metadata can be used to embed arbitrary data for exfiltration
+    "-metadata", "-metadata:s", "-metadata:g",
+    # filter_complex can contain network destinations
+    "-filter_complex",
+    # Can write to multiple outputs including network
+    "-f", "tee",
+    # HTTP method override (can enable POST/PUT)
+    "-method",
+    # Can be used to send data via HTTP headers
+    "-headers",
+    # Content type manipulation
+    "-content_type",
+}
 
 # =============================================================================
 # ERRORS
@@ -1968,28 +1986,29 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                         "find -exec can execute arbitrary commands. Use find + manual processing instead."
                     )
         
-        # If awk, block system() and getline pipes (can execute commands)
-        if cmd == "awk" and args is not None:
+        # If awk (or variants), block system() and getline pipes (can execute commands)
+        # gawk, mawk, nawk are all awk implementations with same dangerous capabilities
+        if cmd in {"awk", "gawk", "mawk", "nawk"} and args is not None:
             for arg in args:
                 if AWK_DANGEROUS_PATTERNS.search(str(arg)):
                     raise StorageError(
                         "ARGUMENT_FORBIDDEN",
-                        "awk script contains forbidden patterns (system, getline pipe)",
+                        f"{cmd} script contains forbidden patterns (system, getline pipe)",
                         {"argument": str(arg)[:100]},
-                        "awk system() and getline pipes can execute commands"
+                        f"{cmd} system() and getline pipes can execute commands"
                     )
         
-        # If ln, block -s (symbolic links can point outside chroot)
-        if cmd == "ln" and args is not None:
-            for arg in args:
-                arg_str = str(arg)
-                if arg_str == "-s" or arg_str == "--symbolic" or (arg_str.startswith("-") and "s" in arg_str and not arg_str.startswith("--")):
-                    raise StorageError(
-                        "ARGUMENT_FORBIDDEN",
-                        "Symbolic links (-s) are forbidden",
-                        {"argument": arg_str},
-                        "Symlinks can point outside the allowed zone. Use hard links (ln without -s) or cp instead."
-                    )
+        # Block ln entirely - both symlinks and hard links have security risks
+        # - Symlinks can point outside chroot
+        # - Hard links can reference sensitive files on the same filesystem
+        # Use cp instead for safe file duplication
+        if cmd == "ln":
+            raise StorageError(
+                "COMMAND_FORBIDDEN",
+                "ln command is forbidden for security reasons",
+                {"command": "ln"},
+                "Use 'cp' instead to copy files. Both symlinks and hard links pose security risks."
+            )
         
         # If tar, block --absolute-names / -P (extracts to absolute paths)
         if cmd == "tar" and args is not None:
@@ -2056,6 +2075,28 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                                 {"argument": str(arg), "protocol": protocol},
                                 "This protocol can send data to remote servers. Ask admin to set network_mode to 'all'"
                             )
+
+                # Block dangerous ffmpeg options that can be used for exfiltration
+                for i, arg in enumerate(args):
+                    arg_str = str(arg)
+                    # Check exact match or prefix match (e.g., -metadata:s:v)
+                    for dangerous_opt in FFMPEG_DANGEROUS_OPTIONS:
+                        if arg_str == dangerous_opt or arg_str.startswith(dangerous_opt + ":"):
+                            raise StorageError(
+                                "ARGUMENT_FORBIDDEN",
+                                f"ffmpeg option '{arg_str}' is forbidden in 'safe' mode",
+                                {"argument": arg_str, "option": dangerous_opt},
+                                "This option can be used for data exfiltration. Ask admin to set network_mode to 'all'"
+                            )
+                    # Check for tee muxer in format specification
+                    if arg_str == "-f" and i + 1 < len(args) and str(args[i + 1]).lower() == "tee":
+                        raise StorageError(
+                            "ARGUMENT_FORBIDDEN",
+                            "ffmpeg tee muxer is forbidden in 'safe' mode",
+                            {"argument": "-f tee"},
+                            "The tee muxer can duplicate output to multiple destinations. Ask admin to set network_mode to 'all'"
+                        )
+
                 # Input URLs are ok
                 return True
             else:
@@ -2371,6 +2412,26 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
             else:
                 stderr_handle = subprocess.PIPE
             
+            # Create preexec function to set resource limits (DoS protection)
+            def set_resource_limits():
+                """Apply resource limits to prevent DoS attacks."""
+                # Memory limit
+                mem_limit_mb = self.valves.exec_memory_limit_mb
+                if mem_limit_mb > 0:
+                    mem_limit_bytes = mem_limit_mb * 1024 * 1024
+                    try:
+                        resource.setrlimit(resource.RLIMIT_AS, (mem_limit_bytes, mem_limit_bytes))
+                    except (ValueError, resource.error):
+                        pass  # May fail on some systems
+
+                # CPU time limit
+                cpu_limit = self.valves.exec_cpu_limit_seconds
+                if cpu_limit > 0:
+                    try:
+                        resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit))
+                    except (ValueError, resource.error):
+                        pass  # May fail on some systems
+
             result = subprocess.run(
                 full_cmd,
                 cwd=str(cwd),
@@ -2378,6 +2439,7 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                 stderr=stderr_handle,
                 text=True,
                 timeout=timeout,
+                preexec_fn=set_resource_limits,
             )
             
             # Close files before reading them
@@ -2719,6 +2781,23 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
             self._git_run(["init"], repo_path)
             self._git_run(["config", "user.email", "storage@openwebui.local"], repo_path)
             self._git_run(["config", "user.name", "Fileshed"], repo_path)
+            # Security: disable hooks to prevent code execution via malicious repos
+            self._neutralize_git_hooks(repo_path)
+
+    def _neutralize_git_hooks(self, repo_path: Path) -> None:
+        """
+        Neutralizes Git hooks to prevent arbitrary code execution.
+        This is critical when cloning untrusted repositories.
+        """
+        hooks_path = repo_path / ".git" / "hooks"
+        if hooks_path.exists():
+            # Remove all hook files (they could be malicious)
+            import shutil
+            shutil.rmtree(hooks_path, ignore_errors=True)
+            # Recreate empty hooks directory
+            hooks_path.mkdir(exist_ok=True)
+        # Configure git to use empty hooks path (defense in depth)
+        self._git_run(["config", "core.hooksPath", "/dev/null"], repo_path)
 
     def _git_commit(self, repo_path: Path, message: str) -> None:
         """Performs a Git commit."""
@@ -3911,6 +3990,18 @@ class Tools:
             default=5000000,
             description="Absolute max output size in bytes (~5MB). Even max_output=0 cannot exceed this."
         )
+        exec_memory_limit_mb: int = Field(
+            default=512,
+            description="Memory limit for subprocess execution in MB (0 = no limit). Protects against DoS."
+        )
+        exec_cpu_limit_seconds: int = Field(
+            default=60,
+            description="CPU time limit for subprocess in seconds (0 = no limit). Protects against CPU exhaustion."
+        )
+        sqlite_readonly: bool = Field(
+            default=False,
+            description="If True, SQLite queries are restricted to SELECT only (no INSERT/UPDATE/DELETE/DROP). Safer for untrusted data."
+        )
     
     class UserValves(BaseModel):
         """Per-user configuration. Users can set these in Tools > Fileshed > Settings."""
@@ -4019,7 +4110,33 @@ class Tools:
                 stderr_file=stderr_path,
                 redirect_stderr_to_stdout=redirect_stderr_to_stdout,
             )
-            
+
+            # Security: neutralize git hooks after clone to prevent code execution
+            # from malicious repositories
+            if cmd == "git" and args and args[0] == "clone" and result["returncode"] == 0:
+                # Determine the cloned repo directory
+                # git clone <url> [target] - target is last non-flag arg, or derived from URL
+                clone_target = None
+                for arg in reversed(args[1:]):
+                    arg_str = str(arg)
+                    if not arg_str.startswith("-"):
+                        clone_target = arg_str
+                        break
+
+                if clone_target:
+                    # Check if it's a URL (last arg is URL, so repo dir is derived from URL)
+                    if "://" in clone_target or clone_target.endswith(".git"):
+                        # Extract repo name from URL
+                        repo_name = clone_target.rstrip("/").split("/")[-1]
+                        if repo_name.endswith(".git"):
+                            repo_name = repo_name[:-4]
+                        clone_path = ctx.zone_root / repo_name
+                    else:
+                        clone_path = ctx.zone_root / clone_target
+
+                    if clone_path.exists() and (clone_path / ".git").exists():
+                        self._core._neutralize_git_hooks(clone_path)
+
             response_data = {
                 "zone": ctx.zone_name,
                 "command": cmd,
@@ -5133,18 +5250,32 @@ class Tools:
             extracted_files = []
             
             with zipfile.ZipFile(src_path, 'r') as zf:
-                # Security: check for path traversal in zip entries
+                # Security: check for path traversal in zip entries (ZIP Slip prevention)
+                dest_resolved = dest_path.resolve()
                 for member in zf.namelist():
-                    # Block absolute paths and .. in zip entries
-                    if member.startswith('/') or '..' in member:
+                    # Block absolute paths
+                    if member.startswith('/'):
                         raise StorageError(
                             "PATH_ESCAPE",
-                            f"ZIP contains dangerous path: {member}",
+                            f"ZIP contains absolute path: {member}",
                             {"member": member},
                             "ZIP file may be malicious (path traversal attempt)"
                         )
-                
-                # Extract all files
+
+                    # Resolve the target path and verify it stays within dest
+                    # This catches cases like "foo/../../../etc/passwd"
+                    member_path = (dest_path / member).resolve()
+                    try:
+                        member_path.relative_to(dest_resolved)
+                    except ValueError:
+                        raise StorageError(
+                            "PATH_ESCAPE",
+                            f"ZIP contains path traversal: {member}",
+                            {"member": member, "resolved": str(member_path)},
+                            "ZIP file may be malicious (escapes destination directory)"
+                        )
+
+                # Extract all files (safe after validation)
                 zf.extractall(dest_path)
                 extracted_files = zf.namelist()
             
@@ -6440,7 +6571,16 @@ class Tools:
             # Check if this is a read or write query
             query_stripped = query.strip().upper()
             is_read_query = query_stripped.startswith(("SELECT", "PRAGMA", "EXPLAIN"))
-            
+
+            # Block write operations if sqlite_readonly valve is enabled
+            if self.valves.sqlite_readonly and not is_read_query:
+                raise StorageError(
+                    "COMMAND_FORBIDDEN",
+                    "Write operations are disabled (sqlite_readonly=True)",
+                    {"query_type": query_stripped.split()[0] if query_stripped else "unknown"},
+                    hint="Only SELECT, PRAGMA, and EXPLAIN queries are allowed. Ask admin to disable sqlite_readonly."
+                )
+
             # Block write operations in readonly zones
             if readonly and not is_read_query:
                 raise StorageError(
