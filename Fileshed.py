@@ -2,7 +2,7 @@
 title: Fileshed
 description: Persistent file storage with group collaboration. FIRST: Run shed_help() for quick reference or shed_help(howto="...") for guides: download, csv_to_sqlite, upload, share, edit, commands, network, paths, full. Config: shed_parameters().
 author: Fade78 (with Claude Opus 4.5)
-version: 1.0.1
+version: 1.0.2
 license: MIT
 required_open_webui_version: 0.4.0
 
@@ -5185,43 +5185,67 @@ class Tools:
         zone: str,
         src: str,
         dest: str = "",
+        src_zone: str = "",
         __user__: dict = {},
         __metadata__: dict = {},
     ) -> str:
         """
         Extracts a ZIP archive using Python zipfile (builtin, no external dependency).
         Works in Storage or Documents zones.
-        
-        :param zone: Target zone ("storage" or "documents")
-        :param src: Path to ZIP file (relative to zone)
+
+        :param zone: Destination zone for extraction ("storage" or "documents")
+        :param src: Path to ZIP file (relative to src_zone or zone if src_zone is empty)
         :param dest: Destination folder (relative to zone). Empty = same folder as ZIP
+        :param src_zone: Source zone where ZIP is located ("uploads", "storage", or "documents"). Empty = use zone
         :return: List of extracted files as JSON
-        
+
         Example:
             shed_unzip(zone="storage", src="downloads/repo.zip", dest="projects/repo")
+            shed_unzip(zone="storage", src="archive.zip", dest="extracted", src_zone="uploads")
         """
         try:
             user_root = self._core._get_user_root(__user__)
             zone_lower = zone.lower()
-            
-            # Validate zone
+
+            # Validate destination zone (must be writable)
             if zone_lower not in ("storage", "documents"):
                 raise StorageError(
                     "ZONE_FORBIDDEN",
-                    f"Zone '{zone}' not allowed for unzip",
+                    f"Zone '{zone}' not allowed for unzip destination",
                     {"zone": zone},
                     "Use 'storage' or 'documents'"
                 )
-            
-            # Get zone path
+
+            # Get destination zone path
             if zone_lower == "storage":
                 zone_root = user_root / "Storage" / "data"
             else:
                 zone_root = user_root / "Documents" / "data"
-            
+
+            # Determine source zone (defaults to destination zone if not specified)
+            src_zone_lower = src_zone.lower() if src_zone else zone_lower
+
+            # Validate source zone
+            if src_zone_lower not in ("uploads", "storage", "documents"):
+                raise StorageError(
+                    "ZONE_FORBIDDEN",
+                    f"Source zone '{src_zone}' not allowed",
+                    {"src_zone": src_zone},
+                    "Use 'uploads', 'storage', or 'documents'"
+                )
+
+            # Get source zone path
+            if src_zone_lower == "uploads":
+                conv_id = self._core._get_conv_id(__metadata__)
+                src_zone_root = user_root / "Uploads" / conv_id
+            elif src_zone_lower == "storage":
+                src_zone_root = user_root / "Storage" / "data"
+            else:
+                src_zone_root = user_root / "Documents" / "data"
+
             # Validate and resolve paths
             src = self._core._validate_relative_path(src)
-            src_path = self._core._resolve_chroot_path(zone_root, src)
+            src_path = self._core._resolve_chroot_path(src_zone_root, src)
             
             if not src_path.exists():
                 raise StorageError("FILE_NOT_FOUND", f"ZIP file not found: {src}")
@@ -5283,21 +5307,24 @@ class Tools:
             if zone_lower == "documents":
                 docs_data = user_root / "Documents" / "data"
                 self._core._git_run(["add", "-A"], cwd=docs_data)
+                src_info = f"{src_zone_lower}:{src}" if src_zone_lower != zone_lower else src
                 self._core._git_run(
-                    ["commit", "-m", f"Extracted {src} to {dest or 'same folder'}", "--allow-empty"],
+                    ["commit", "-m", f"Extracted {src_info} to {dest or 'same folder'}", "--allow-empty"],
                     cwd=docs_data
                 )
-            
+
             return self._core._format_response(
                 True,
                 data={
                     "source": src,
+                    "source_zone": src_zone_lower,
                     "destination": str(dest_path.relative_to(zone_root)),
+                    "destination_zone": zone_lower,
                     "files_count": len(extracted_files),
                     "files": extracted_files[:50],  # Limit to first 50
                     "truncated": len(extracted_files) > 50,
                 },
-                message=f"Extracted {len(extracted_files)} files"
+                message=f"Extracted {len(extracted_files)} files from {src_zone_lower} to {zone_lower}"
             )
             
         except StorageError as e:
