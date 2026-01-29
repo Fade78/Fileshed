@@ -5163,21 +5163,14 @@ class Tools:
                     data={"errors": errors} if errors else None
                 )
             
-            result_data = {
-                "imported": imported,
-                "count": len(imported),
-                "warning": (
-                    "Uploads files are permanent: they are NOT deleted when the conversation is deleted. "
-                    "Use shed_delete(zone='uploads', path='...') to remove them when no longer needed."
-                ),
-            }
+            result_data = {"imported": imported, "count": len(imported)}
             if errors:
                 result_data["errors"] = errors
 
             return self._core._format_response(
                 True,
                 data=result_data,
-                message=f"Imported {len(imported)} file(s). WARNING: Uploads files persist after conversation deletion."
+                message=f"Imported {len(imported)} file(s) to Uploads. Use shed_delete(zone='uploads', path='...') to remove."
             )
             
         except Exception as e:
