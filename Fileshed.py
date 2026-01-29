@@ -4400,6 +4400,9 @@ class Tools:
                         repo_name = clone_target.rstrip("/").split("/")[-1]
                         if repo_name.endswith(".git"):
                             repo_name = repo_name[:-4]
+                        # Fallback if repo_name is empty (edge case: malformed URL)
+                        if not repo_name:
+                            repo_name = "repository"
                         clone_path = ctx.zone_root / repo_name
                     else:
                         clone_path = ctx.zone_root / clone_target
@@ -4776,10 +4779,15 @@ class Tools:
                     "locked_by": user_id,
                 }, message=f"File opened for editing: {path}")
             except Exception:
-                # Release lock on any failure after acquisition
+                # Clean up editzone and release lock on any failure after acquisition
+                try:
+                    if editzone_path.exists():
+                        editzone_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
                 lock_path.unlink(missing_ok=True)
                 raise
-            
+
         except StorageError as e:
             return self._core._format_error(e, "shed_lockedit_open")
         except Exception:
@@ -5666,12 +5674,23 @@ class Tools:
                     zf.extractall(dest_path)
                     extracted_files = zf.namelist()
                 except Exception:
-                    # Clean up any partially extracted files on error
-                    for member in zf.namelist():
+                    # Clean up any partially extracted files and directories on error
+                    # First remove files, then directories (in reverse order for nested dirs)
+                    members = zf.namelist()
+                    # Remove files first
+                    for member in members:
                         member_path = dest_path / member
                         try:
                             if member_path.is_file():
                                 member_path.unlink()
+                        except OSError:
+                            pass
+                    # Remove empty directories (reverse sorted for nested cleanup)
+                    for member in sorted(members, reverse=True):
+                        member_path = dest_path / member
+                        try:
+                            if member_path.is_dir() and not any(member_path.iterdir()):
+                                member_path.rmdir()
                         except OSError:
                             pass
                     raise
