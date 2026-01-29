@@ -104,6 +104,9 @@ ZIP_MAX_COMPRESSION_RATIO = 100                  # Max compression ratio (100:1)
 MAX_HEXDUMP_BYTES = 4096
 DEFAULT_HEXDUMP_BYTES = 256
 
+# Validation patterns
+UUID_PATTERN = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+
 
 # =============================================================================
 # ZONE CONTEXT
@@ -1747,7 +1750,30 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
         """Returns the user's root directory."""
         if __user__ is None:
             __user__ = {}
-        user_id = __user__.get("id", "anonymous")
+        user_id = __user__.get("id", "")
+
+        # Validate user_id: must be non-empty and valid UUID format
+        if not user_id or not isinstance(user_id, str):
+            raise StorageError(
+                "INVALID_USER",
+                "User ID is missing or invalid",
+                hint="Authentication required"
+            )
+        user_id = user_id.strip()
+        if not user_id:
+            raise StorageError(
+                "INVALID_USER",
+                "User ID is empty",
+                hint="Authentication required"
+            )
+        # UUID format validation (8-4-4-4-12 hex pattern)
+        if not UUID_PATTERN.match(user_id):
+            raise StorageError(
+                "INVALID_USER",
+                "User ID format is invalid",
+                hint="Valid UUID required"
+            )
+
         return Path(self.valves.storage_base_path) / "users" / user_id
 
     def _get_groups_root(self) -> Path:
@@ -2896,12 +2922,29 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                 timeout=timeout,
             )
             return result
+        except FileNotFoundError:
+            raise StorageError(
+                "GIT_NOT_AVAILABLE",
+                "Git is not installed or not in PATH",
+                hint="Install git or contact administrator"
+            )
+        except PermissionError:
+            raise StorageError(
+                "PERMISSION_DENIED",
+                "Cannot execute git command",
+                hint="Check file permissions"
+            )
+        except OSError:
+            raise StorageError(
+                "EXECUTION_ERROR",
+                "Failed to execute git command",
+                hint="Check system configuration"
+            )
         except subprocess.TimeoutExpired:
             raise StorageError(
                 "TIMEOUT",
                 f"Git command timed out after {timeout}s",
-                {"command": ["git"] + args},
-                "Try a simpler operation or increase timeout"
+                hint="Try a simpler operation or increase timeout"
             )
 
     def _check_command_available(self, cmd: str) -> bool:
@@ -4980,10 +5023,12 @@ class Tools:
             # Get editzone path
             editzone_path = self._core._get_editzone_path(ctx.editzone_base, ctx.conv_id, path)
             
-            # Cleanup
-            if editzone_path.exists():
-                self._core._rm_with_empty_parents(editzone_path, ctx.editzone_base / "editzone")
-            lock_path.unlink(missing_ok=True)
+            # Cleanup - ensure lock is always released even if cleanup fails
+            try:
+                if editzone_path.exists():
+                    self._core._rm_with_empty_parents(editzone_path, ctx.editzone_base / "editzone")
+            finally:
+                lock_path.unlink(missing_ok=True)
             
             return self._core._format_response(True, data={
                 "zone": ctx.zone_name,
