@@ -6182,8 +6182,8 @@ class Tools:
             # Read file
             try:
                 content = file_path.read_bytes()
-            except Exception as e:
-                raise StorageError("EXEC_ERROR", f"Cannot read file: {e}")
+            except Exception:
+                raise StorageError("EXEC_ERROR", "Cannot read file")
             
             # Count existing line endings
             crlf_count = content.count(b'\r\n')
@@ -7236,12 +7236,12 @@ class Tools:
                 # Clean up on failure
                 dest_path.unlink(missing_ok=True)
                 raise
-            except Exception as e:
+            except Exception:
                 dest_path.unlink(missing_ok=True)
                 raise StorageError(
                     "INTERNAL_API_ERROR",
-                    f"Error calling Open WebUI API: {e}",
-                    {},
+                    "Error calling Open WebUI API",
+                    None,
                     "Check Open WebUI version compatibility"
                 )
                 
