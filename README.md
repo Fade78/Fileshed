@@ -12,6 +12,9 @@
 
 ---
 
+> *"I'm delighted to contribute to Fileshed. Manipulating files, chaining transformations, exporting results — all without polluting the context... This feels strangely familiar."*
+> — Claude Opus 4.5
+
 ## What is Fileshed?
 
 Fileshed gives your LLM a persistent workspace. It provides:
@@ -101,11 +104,20 @@ Fileshed gives your LLM a persistent workspace. It provides:
 Fileshed provides four storage zones:
 
 ```
-📥 Uploads     → Files you give to the LLM (read-only for it)
-📦 Storage     → LLM's personal workspace (read/write)
-📚 Documents   → Version-controlled with Git (automatic history!)
-👥 Groups      → Shared team workspaces (requires group= parameter)
+📥 Uploads     → Files you upload to the conversation (read-only, per conversation)
+📦 Storage     → Persistent workspace (read/write, per user)
+📚 Documents   → Version-controlled with Git (read/write, per user)
+👥 Groups      → Shared team workspace (read/write, per group)
 ```
+
+| Zone | Scope | Persistence | Versioning |
+|------|-------|-------------|------------|
+| Uploads | Per conversation | Temporary* | — |
+| Storage | Per user | Permanent | Manual (create repos anywhere) |
+| Documents | Per user | Permanent | Automatic (whole zone) |
+| Groups | Per group | Permanent | Automatic (whole zone) |
+
+*Uploads files persist until manually deleted, but are isolated per conversation.
 
 All operations use the `zone=` parameter to specify where to work.
 
@@ -426,11 +438,14 @@ shed_patch_text(zone="storage", path="projects/2024/.keep", content="")
 | `lock_max_age_hours` | 24 | Max lock duration before expiration |
 | `exec_timeout_default` | 30 | Default command timeout (seconds) |
 | `exec_timeout_max` | 300 | Maximum allowed timeout (seconds) |
+| `exec_memory_limit_mb` | 512 | Memory limit for subprocesses (MB) |
+| `exec_cpu_limit_seconds` | 60 | CPU time limit for subprocesses (seconds) |
 | `group_default_mode` | `group` | Default write mode: `owner`, `group`, `owner_ro` |
 | `network_mode` | `disabled` | `disabled`, `safe`, or `all` |
 | `openwebui_api_url` | `http://localhost:8080` | Base URL for download links |
 | `max_output_default` | 50000 | Default output truncation (~50KB) |
 | `max_output_absolute` | 5000000 | Absolute max output (~5MB) |
+| `sqlite_readonly` | `false` | Restrict SQLite to SELECT only |
 
 ---
 

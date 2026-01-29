@@ -386,14 +386,17 @@ The following patterns are blocked in all arguments:
 | `quota_per_user_mb` | 1000 | User quota in MB |
 | `quota_per_group_mb` | 2000 | Group quota in MB |
 | `max_file_size_mb` | 300 | Max file size |
+| `lock_max_age_hours` | 24 | Lock expiration time |
+| `exec_timeout_default` | 30 | Default command timeout (seconds) |
+| `exec_timeout_max` | 300 | Maximum command timeout (seconds) |
+| `exec_memory_limit_mb` | 512 | Memory limit for subprocesses (MB) |
+| `exec_cpu_limit_seconds` | 60 | CPU time limit for subprocesses (seconds) |
+| `group_default_mode` | `group` | Default write mode for new group files |
 | `network_mode` | `disabled` | `disabled`, `safe`, or `all` |
-| `exec_timeout_default` | 30  | Default command timeout |
-| `exec_timeout_max` | 300 | Maximum command timeout |
+| `openwebui_api_url` | `http://localhost:8080` | Open WebUI base URL for download links |
 | `max_output_default` | 50000 | Default output truncation (~50KB) |
 | `max_output_absolute` | 5000000 | Absolute max output (~5MB) |
-| `lock_max_age_hours` | 24  | Lock expiration time |
-| `group_default_mode` | `group` | Default write mode for new group files |
-| `openwebui_api_url` | `http://localhost:8080` | Open WebUI base URL for download links |
+| `sqlite_readonly` | `false` | Restrict SQLite to SELECT only |
 
 ## Error Handling
 
