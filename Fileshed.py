@@ -3777,8 +3777,16 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
             return self._format_response(True, data=result, message=f"File {action}: {lines_affected} line(s) affected")
             
         finally:
-            if safe and lock_path and lock_path.exists():
-                lock_path.unlink(missing_ok=True)
+            # Cleanup on error: release lock and remove editzone if it wasn't moved
+            if safe and lock_path:
+                if lock_path.exists():
+                    lock_path.unlink(missing_ok=True)
+                # Clean up editzone if it still exists (wasn't successfully moved)
+                if 'edit_path' in dir() and edit_path.exists():
+                    try:
+                        edit_path.unlink()
+                    except OSError:
+                        pass
 
     async def _patch_bytes_impl(
         self,
@@ -4003,8 +4011,16 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
                 message=f"File {'created' if file_created else 'patched'}: {len(content_bytes)} bytes written")
             
         finally:
-            if safe and lock_path and lock_path.exists():
-                lock_path.unlink(missing_ok=True)
+            # Cleanup on error: release lock and remove editzone if it wasn't moved
+            if safe and lock_path:
+                if lock_path.exists():
+                    lock_path.unlink(missing_ok=True)
+                # Clean up editzone if it still exists (wasn't successfully moved)
+                if 'edit_path' in dir() and edit_path.exists():
+                    try:
+                        edit_path.unlink()
+                    except OSError:
+                        pass
 
 
     # =========================================================================
@@ -4161,7 +4177,7 @@ class Tools:
         self,
         zone: str,
         cmd: str,
-        args: list = [],
+        args: list = None,
         timeout: int = None,
         max_output: int = None,
         stdout_file: str = None,
@@ -4209,8 +4225,9 @@ class Tools:
         - stdout_file/stderr_file: paths relative to zone root
         """
         try:
+            args = args or []  # Handle None default
             ctx = self._core._resolve_zone(zone, group, __user__, __metadata__)
-            
+
             # Validate command against zone whitelist
             self._core._validate_command(cmd, ctx.whitelist, args)
             
@@ -4672,7 +4689,7 @@ class Tools:
         zone: str,
         path: str,
         cmd: str,
-        args: list = [],
+        args: list = None,
         timeout: int = None,
         group: str = None,
         allow_zone_in_path: bool = False,
@@ -4696,6 +4713,7 @@ class Tools:
             shed_lockedit_exec(zone="storage", path="code.py", cmd="cat", args=["."])
         """
         try:
+            args = args or []  # Handle None default
             ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=True)
 
             path = self._core._validate_relative_path(path, ctx.zone_name, allow_zone_in_path)
@@ -5507,6 +5525,38 @@ class Tools:
                             {"member": member, "resolved": str(member_path)},
                             "ZIP file may be malicious (escapes destination directory)"
                         )
+
+                # ZIP bomb protection: check decompressed size and file count
+                MAX_DECOMPRESSED_SIZE = 500 * 1024 * 1024  # 500 MB max
+                MAX_FILES = 10000  # Max number of files
+                MAX_RATIO = 100  # Max compression ratio (100:1)
+
+                total_size = sum(info.file_size for info in zf.infolist())
+                file_count = len(zf.infolist())
+
+                if file_count > MAX_FILES:
+                    raise StorageError(
+                        "ZIP_BOMB",
+                        f"ZIP contains too many files ({file_count})",
+                        {"file_count": file_count, "max": MAX_FILES},
+                        "ZIP file may be a decompression bomb"
+                    )
+
+                if total_size > MAX_DECOMPRESSED_SIZE:
+                    raise StorageError(
+                        "ZIP_BOMB",
+                        f"ZIP decompressed size too large ({total_size // (1024*1024)} MB)",
+                        {"decompressed_size": total_size, "max": MAX_DECOMPRESSED_SIZE},
+                        "ZIP file may be a decompression bomb"
+                    )
+
+                if zip_size > 0 and total_size / zip_size > MAX_RATIO:
+                    raise StorageError(
+                        "ZIP_BOMB",
+                        f"ZIP compression ratio too high ({total_size // zip_size}:1)",
+                        {"ratio": total_size / zip_size, "max_ratio": MAX_RATIO},
+                        "ZIP file may be a decompression bomb"
+                    )
 
                 # Extract all files (safe after validation)
                 zf.extractall(dest_path)
@@ -6460,7 +6510,7 @@ class Tools:
                                 hint="Use if_exists='replace' or if_exists='append'"
                             )
                         elif if_exists == "replace":
-                            cursor.execute(f"DROP TABLE IF EXISTS {table}")
+                            cursor.execute(f'DROP TABLE IF EXISTS "{table}"')
                             table_exists = False
                     
                     import_info = {"method": "unknown"}
@@ -6639,12 +6689,12 @@ class Tools:
                             
                             # Create table if needed
                             if not table_exists or if_exists == "replace":
-                                columns_def = ", ".join(f"{col} TEXT" for col in clean_headers)
-                                cursor.execute(f"CREATE TABLE {table} ({columns_def})")
-                            
+                                columns_def = ", ".join(f'"{col}" TEXT' for col in clean_headers)
+                                cursor.execute(f'CREATE TABLE "{table}" ({columns_def})')
+
                             # Prepare INSERT statement
                             placeholders = ", ".join("?" * len(clean_headers))
-                            insert_sql = f"INSERT INTO {table} VALUES ({placeholders})"
+                            insert_sql = f'INSERT INTO "{table}" VALUES ({placeholders})'
                             
                             # Date parsing setup
                             date_col_indices = []
@@ -6770,14 +6820,17 @@ class Tools:
                     )
                     
                 except StorageError:
+                    conn.rollback()  # Explicit rollback on error
                     raise
                 except sqlite3.Error:
+                    conn.rollback()  # Explicit rollback on error
                     raise StorageError(
                         "EXEC_ERROR",
                         "SQLite error during CSV import",
                         {"csv": import_csv, "table": table}
                     )
                 except Exception:
+                    conn.rollback()  # Explicit rollback on error
                     raise StorageError(
                         "EXEC_ERROR",
                         "CSV import failed",
@@ -6965,7 +7018,8 @@ class Tools:
                         message=f"Query executed successfully ({rowcount} row(s) affected)"
                     )
                     
-            except sqlite3.Error as e:
+            except sqlite3.Error:
+                conn.rollback()  # Explicit rollback on error
                 raise StorageError(
                     "EXEC_ERROR",
                     "SQLite query failed",
@@ -8046,9 +8100,9 @@ shed_tree(zone="storage") # Directory tree
                 raise StorageError(
                     "NOT_FILE_OWNER",
                     "Only the file owner can change the write mode",
-                    {"owner": ownership["owner_id"], "your_id": user_id}
+                    {"path": path}
                 )
-            
+
             # Update mode
             old_mode = ownership["write_access"]
             self._core._set_file_ownership(group, path, user_id, mode)
@@ -8109,9 +8163,9 @@ shed_tree(zone="storage") # Directory tree
                 raise StorageError(
                     "NOT_FILE_OWNER",
                     "Only the file owner can transfer ownership",
-                    {"owner": ownership["owner_id"], "your_id": user_id}
+                    {"path": path}
                 )
-            
+
             # Check new owner is group member
             if not self._core._is_group_member(new_owner, group):
                 raise StorageError(
