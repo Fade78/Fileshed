@@ -1533,24 +1533,24 @@ The `zone` parameter already specifies WHERE to operate. The path in `args` is R
 
 ### Example of the mistake
 
-User asks: "In Documents, create a folder Stolonique"
+User asks: "In Documents, create a folder MyProject"
 
 ```
-❌ WRONG (creates Documents/Documents/Stolonique):
-shed_exec(zone="Documents", cmd="mkdir", args=["-p", "Documents/Stolonique"])
+❌ WRONG (creates Documents/Documents/MyProject):
+shed_exec(zone="Documents", cmd="mkdir", args=["-p", "Documents/MyProject"])
                                                      ^^^^^^^^^^
                                                      This creates an unwanted "Documents" subfolder!
 
-✅ CORRECT (creates Documents/Stolonique):
-shed_exec(zone="Documents", cmd="mkdir", args=["-p", "Stolonique"])
+✅ CORRECT (creates Documents/MyProject):
+shed_exec(zone="Documents", cmd="mkdir", args=["-p", "MyProject"])
 ```
 
 ### Why this happens
 
 The zone parameter already points to the Documents folder:
 - zone="Documents" → You're working INSIDE Documents
-- args=["Stolonique"] → Creates Stolonique/ inside Documents
-- args=["Documents/Stolonique"] → Creates Documents/Stolonique/ inside Documents (WRONG!)
+- args=["MyProject"] → Creates MyProject/ inside Documents
+- args=["Documents/MyProject"] → Creates Documents/MyProject/ inside Documents (WRONG!)
 
 ### More examples
 
