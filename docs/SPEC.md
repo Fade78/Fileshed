@@ -425,20 +425,37 @@ Response format:
 }
 ```
 
-Common error codes:
+### Error Codes Reference
 
-- `FILE_NOT_FOUND` — Path does not exist
-- `FILE_EXISTS` — Destination already exists
-- `FILE_TOO_LARGE` — File exceeds max_file_size_mb limit
-- `PATH_ESCAPE` — Path traversal attempt blocked
-- `PERMISSION_DENIED` — Group ownership check failed
-- `COMMAND_FORBIDDEN` — Command not in whitelist
-- `QUOTA_EXCEEDED` — Storage quota exceeded
-- `FILE_LOCKED` — File locked by another user/conversation
-- `INVALID_ZONE` — Unknown zone parameter
-- `ZONE_READONLY` — Write operation on read-only zone (Uploads)
-- `MISSING_PARAMETER` — Required parameter missing
-- `GROUP_ACCESS_DENIED` — User is not a member of the group
+| Code | Description |
+| --- | --- |
+| `FILE_NOT_FOUND` | Path does not exist |
+| `FILE_EXISTS` | Destination already exists |
+| `FILE_TOO_LARGE` | File exceeds max_file_size_mb limit |
+| `FILE_LOCKED` | File locked by another user/conversation |
+| `PATH_ESCAPE` | Path traversal or symlink escape attempt blocked |
+| `PERMISSION_DENIED` | Group ownership check failed |
+| `COMMAND_FORBIDDEN` | Command not in whitelist |
+| `ARGUMENT_FORBIDDEN` | Dangerous argument pattern detected |
+| `QUOTA_EXCEEDED` | Storage quota exceeded |
+| `INVALID_ZONE` | Unknown zone parameter |
+| `ZONE_FORBIDDEN` | Invalid zone for this operation |
+| `ZONE_READONLY` | Write operation on read-only zone (Uploads) |
+| `MISSING_PARAMETER` | Required parameter missing |
+| `INVALID_PARAMETER` | Invalid parameter value |
+| `GROUP_ACCESS_DENIED` | User is not a member of the group |
+| `NOT_A_FILE` | Expected file but found directory |
+| `NOT_IN_EDIT_MODE` | File not open for locked editing |
+| `PATTERN_NOT_FOUND` | Regex pattern not found in file |
+| `EXEC_ERROR` | Command execution failed |
+| `EXEC_TIMEOUT` | Command exceeded timeout |
+| `INVALID_FORMAT` | Invalid file format for operation |
+| `INVALID_OWNER` | Invalid owner ID for chown |
+| `CSV_PARSE_ERROR` | Failed to parse CSV file |
+| `TABLE_EXISTS` | SQLite table already exists (use if_exists) |
+| `NETWORK_FORBIDDEN` | Network access disabled by policy |
+| `LINK_NOT_FOUND` | Download link not found |
+| `LINK_ACCESS_DENIED` | Not authorized to access this link |
 
 ## Response Format
 

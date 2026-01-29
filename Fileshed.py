@@ -499,16 +499,16 @@ class _OpenWebUIBridge:
             instance = cls()
             instance._ensure_initialized()
             return True
-        except:
+        except Exception:
             return False
-    
+
     @classmethod
     def get_api_version(cls) -> str:
         """Return the detected Open WebUI API version."""
         try:
             from open_webui import __version__
             return __version__
-        except:
+        except ImportError:
             return "unknown"
 
 
@@ -1858,25 +1858,54 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
         """
         Resolves a relative path within a chroot and verifies it doesn't escape.
         Raises PATH_ESCAPE if escape attempt detected.
+        Also detects symlinks that could point outside the chroot.
         """
         # Clean the path
         relative_path = relative_path.lstrip("/")
-        
-        # Resolve
-        target = (base / relative_path).resolve()
+
+        # Build path without resolving symlinks first
+        raw_path = base / relative_path
+
+        # Check for symlinks in the path that could escape chroot
+        # Walk from base to target, checking each existing component
+        current = base.resolve()
+        parts = Path(relative_path).parts
+        for i, part in enumerate(parts):
+            next_path = current / part
+            if next_path.is_symlink():
+                # Symlink found - resolve it and verify it stays in chroot
+                link_target = next_path.resolve()
+                base_resolved = base.resolve()
+                try:
+                    link_target.relative_to(base_resolved)
+                except ValueError:
+                    raise StorageError(
+                        "PATH_ESCAPE",
+                        "Symlink escape attempt detected",
+                        {"path": relative_path, "symlink": str(next_path)},
+                        "Symlinks pointing outside the zone are not allowed"
+                    )
+            if next_path.exists():
+                current = next_path.resolve()
+            else:
+                # Path doesn't exist yet, remaining parts are for new file/dir
+                break
+
+        # Resolve final path
+        target = raw_path.resolve()
         base_resolved = base.resolve()
-        
+
         # Verify we stay in chroot
         try:
             target.relative_to(base_resolved)
         except ValueError:
             raise StorageError(
                 "PATH_ESCAPE",
-                f"Chroot escape attempt detected",
+                "Chroot escape attempt detected",
                 {"path": relative_path, "chroot": str(base)},
                 "Use only relative paths without ../"
             )
-        
+
         return target
 
     def _validate_relative_path(
@@ -2632,7 +2661,7 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
             for f in files_to_close:
                 try:
                     f.close()
-                except:
+                except OSError:
                     pass
 
     def _ensure_dir(self, path: Path) -> None:
@@ -3587,7 +3616,10 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
         # === SIZE AND QUOTA CHECKS ===
         content_bytes = content.encode('utf-8')
         max_size = self.valves.max_file_size_mb * 1024 * 1024
-        current_size = target_path.stat().st_size if file_exists else 0
+        try:
+            current_size = target_path.stat().st_size if file_exists else 0
+        except FileNotFoundError:
+            current_size = 0
         
         if current_size + len(content_bytes) > max_size:
             raise StorageError("FILE_TOO_LARGE", f"File would exceed {self.valves.max_file_size_mb} MB")
@@ -3864,8 +3896,11 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
         
         # === SIZE CHECKS ===
         max_size = self.valves.max_file_size_mb * 1024 * 1024
-        current_size = target_path.stat().st_size if file_exists else 0
-        
+        try:
+            current_size = target_path.stat().st_size if file_exists else 0
+        except FileNotFoundError:
+            current_size = 0
+
         if offset is not None and offset > current_size:
             raise StorageError("INVALID_PARAMETER", f"Offset {offset} beyond file size ({current_size})")
         
@@ -4301,7 +4336,7 @@ class Tools:
         regex_flags: str = "",
         match_all: bool = False,
         overwrite: bool = False,
-        safe: bool = False,
+        safe: bool = True,
         group: str = None,
         message: str = None,
         mode: str = None,
@@ -4362,7 +4397,7 @@ class Tools:
         position: str = "end",
         offset: int = None,
         length: int = None,
-        safe: bool = False,
+        safe: bool = True,
         group: str = None,
         message: str = None,
         mode: str = None,
@@ -4617,7 +4652,7 @@ class Tools:
                 with open(editzone_path, 'r', encoding='utf-8', errors='replace') as f:
                     content = f.read()
                 is_binary = False
-            except:
+            except (OSError, UnicodeDecodeError):
                 content = None
                 is_binary = True
             
@@ -4964,7 +4999,7 @@ class Tools:
         self,
         src: str,
         dest: str,
-        message: str = "",
+        message: str = None,
         allow_zone_in_path: bool = False,
         __user__: dict = {},
         __metadata__: dict = {},
@@ -5026,7 +5061,7 @@ class Tools:
         self,
         src: str,
         dest: str,
-        message: str = "",
+        message: str = None,
         allow_zone_in_path: bool = False,
         __user__: dict = {},
         __metadata__: dict = {},
@@ -5085,7 +5120,7 @@ class Tools:
         self,
         src: str,
         dest: str,
-        message: str = "",
+        message: str = None,
         allow_zone_in_path: bool = False,
         __user__: dict = {},
         __metadata__: dict = {},
@@ -5247,20 +5282,20 @@ class Tools:
                                         file_path = str(candidate)
                                         break
                                 
-                                # Essayer: /base/file_id
+                                # Try: /base/file_id
                                 candidate = base_path / file_id
                                 if candidate.exists():
                                     file_path = str(candidate)
                                     break
-                                
-                                # Essayer: /base/user_id/file_id
+
+                                # Try: /base/user_id/file_id
                                 if user_id_from_file:
                                     candidate = base_path / user_id_from_file / file_id
                                     if candidate.exists():
                                         file_path = str(candidate)
                                         break
-                                
-                                # Chercher par pattern {id}_*
+
+                                # Search by pattern {id}_*
                                 for f in base_path.glob(f"{file_id}_*"):
                                     file_path = str(f)
                                     if not file_name:
@@ -6343,42 +6378,11 @@ class Tools:
               CSV import keeps data on disk - no context pollution!
         """
         try:
-            user_root = self._core._get_user_root(__user__)
-            conv_id = self._core._get_conv_id(__metadata__)
-            zone_lower = zone.lower()
-            
-            # Determine the zone root
-            if zone_lower == "uploads":
-                zone_root = user_root / "Uploads" / conv_id
-                zone_name = "Uploads"
-                readonly = True
-            elif zone_lower == "storage":
-                zone_root = user_root / "Storage" / "data"
-                zone_name = "Storage"
-                readonly = False
-            elif zone_lower == "documents":
-                zone_root = user_root / "Documents" / "data"
-                zone_name = "Documents"
-                readonly = False
-            elif zone_lower == "group":
-                if not group:
-                    raise StorageError(
-                        "MISSING_PARAMETER",
-                        "Group parameter required when zone='group'",
-                        hint="Add group='group_name' parameter"
-                    )
-                # Validate and resolve group
-                group = self._core._validate_group_id(group)
-                self._core._check_group_access(__user__, group)
-                zone_root = Path(self.valves.storage_base_path) / "groups" / group / "data"
-                zone_name = f"Group:{group}"
-                readonly = False
-            else:
-                raise StorageError(
-                    "ZONE_FORBIDDEN",
-                    f"Invalid zone: {zone}",
-                    hint="Use 'uploads', 'storage', 'documents', or 'group'"
-                )
+            # Use centralized zone resolution
+            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=False)
+            zone_root = ctx.zone_root
+            zone_name = ctx.zone_name
+            readonly = ctx.readonly
 
             # Validate and resolve path
             path = self._core._validate_relative_path(path, zone_name, allow_zone_in_path)
@@ -6453,7 +6457,6 @@ class Tools:
                     
                     if table_exists:
                         if if_exists == "fail":
-                            conn.close()
                             raise StorageError(
                                 "TABLE_EXISTS",
                                 f"Table '{table}' already exists",
@@ -6528,12 +6531,11 @@ class Tools:
                         # Read CSV
                         try:
                             df = pd.read_csv(str(csv_path), **pd_kwargs)
-                        except Exception as e:
-                            conn.close()
+                        except Exception:
                             raise StorageError(
                                 "CSV_PARSE_ERROR",
-                                f"Failed to parse CSV with pandas: {str(e)}",
-                                {"csv": import_csv, "pandas_args": {k: str(v) for k, v in pd_kwargs.items()}},
+                                "Failed to parse CSV with pandas",
+                                {"csv": import_csv},
                                 hint="Try specifying delimiter, encoding, or skip_rows explicitly"
                             )
                         
@@ -6630,7 +6632,6 @@ class Tools:
                                 # No header: first row is data, generate column names
                                 first_data_row = next(reader, None)
                                 if first_data_row is None:
-                                    conn.close()
                                     raise StorageError(
                                         "CSV_EMPTY",
                                         "CSV file is empty (no data rows)",
@@ -6745,8 +6746,7 @@ class Tools:
                                 total_rows += len(batch)
                     
                     conn.commit()
-                    conn.close()
-                    
+
                     response_data = {
                         "db_path": path,
                         "csv_path": import_csv,
@@ -6774,21 +6774,21 @@ class Tools:
                     
                 except StorageError:
                     raise
-                except sqlite3.Error as e:
-                    conn.close()
+                except sqlite3.Error:
                     raise StorageError(
                         "EXEC_ERROR",
-                        f"SQLite error during import: {str(e)}",
+                        "SQLite error during CSV import",
                         {"csv": import_csv, "table": table}
                     )
-                except Exception as e:
-                    conn.close()
+                except Exception:
                     raise StorageError(
                         "EXEC_ERROR",
-                        f"CSV import error: {str(e)}",
+                        "CSV import failed",
                         {"csv": import_csv, "table": table},
                         hint="Try specifying delimiter, encoding, or check CSV format"
                     )
+                finally:
+                    conn.close()
             
             # =====================================================
             # SQL QUERY MODE
@@ -6848,6 +6848,14 @@ class Tools:
                     
                     # Check if user wants CSV export (all results, no context pollution)
                     if output_csv:
+                        # Block CSV export in readonly zones
+                        if readonly:
+                            raise StorageError(
+                                "ZONE_READONLY",
+                                "Cannot export CSV to read-only zone",
+                                {"zone": zone_name, "output_csv": output_csv},
+                                hint="Use 'storage' or 'documents' zone for CSV export"
+                            )
                         # Export all results to CSV file
                         import csv as csv_module
                         
@@ -6868,8 +6876,6 @@ class Tools:
                                 for row in batch:
                                     writer.writerow(list(row))
                                     row_count += 1
-                        
-                        conn.close()
                         
                         return self._core._format_response(
                             True,
@@ -6923,8 +6929,6 @@ class Tools:
                             results = [dict(zip(columns, row)) for row in rows] if rows else []
                             truncated = False
                     
-                    conn.close()
-                    
                     # Build response
                     response_data = {
                         "path": path,
@@ -6952,8 +6956,7 @@ class Tools:
                     conn.commit()
                     rowcount = cursor.rowcount
                     lastrowid = cursor.lastrowid
-                    conn.close()
-                    
+
                     return self._core._format_response(
                         True,
                         data={
@@ -6966,18 +6969,19 @@ class Tools:
                     )
                     
             except sqlite3.Error as e:
-                conn.close()
                 raise StorageError(
                     "EXEC_ERROR",
-                    f"SQLite error: {str(e)}",
+                    "SQLite query failed",
                     {"query": query},
                     hint="Check your SQL syntax"
                 )
-                
+            finally:
+                conn.close()
+
         except StorageError as e:
             return self._core._format_error(e, "shed_sqlite")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="An unexpected error occurred in shed_sqlite")
 
     # =========================================================================
     # DOWNLOAD LINKS (3 functions)
