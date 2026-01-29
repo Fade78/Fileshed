@@ -104,20 +104,18 @@ Fileshed gives your LLM a persistent workspace. It provides:
 Fileshed provides four storage zones:
 
 ```
-📥 Uploads     → Files you upload to the conversation (read-only, per conversation)
-📦 Storage     → Persistent workspace (read/write, per user)
-📚 Documents   → Version-controlled with Git (read/write, per user)
-👥 Groups      → Shared team workspace (read/write, per group)
+📥 Uploads     → Files you upload to the conversation
+📦 Storage     → Persistent workspace
+📚 Documents   → Version-controlled with Git
+👥 Groups      → Shared team workspace
 ```
 
-| Zone | Scope | Persistence | Versioning |
-|------|-------|-------------|------------|
-| Uploads | Per conversation | Temporary* | — |
-| Storage | Per user | Permanent | Manual (create repos anywhere) |
-| Documents | Per user | Permanent | Automatic (whole zone) |
-| Groups | Per group | Permanent | Automatic (whole zone) |
-
-*Uploads files persist until manually deleted, but are isolated per conversation.
+| Zone | Scope | Versioning |
+|------|-------|------------|
+| Uploads | Per conversation | — |
+| Storage | Per user | Manual (create repos anywhere) |
+| Documents | Per user | Automatic (whole zone) |
+| Groups | Per group | Automatic (whole zone) |
 
 All operations use the `zone=` parameter to specify where to work.
 
