@@ -107,6 +107,9 @@ DEFAULT_HEXDUMP_BYTES = 256
 # Validation patterns
 UUID_PATTERN = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
 
+# SQL protection limits
+MAX_SQL_ROWS = 10000  # Hard limit even when user requests unlimited (limit=0)
+
 
 # =============================================================================
 # ZONE CONTEXT
@@ -2784,8 +2787,20 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
             # os.open with O_CREAT | O_EXCL is atomic
             fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
             try:
-                os.write(fd, json.dumps(lock_data, indent=2).encode('utf-8'))
-            finally:
+                lock_content = json.dumps(lock_data, indent=2).encode('utf-8')
+                bytes_written = os.write(fd, lock_content)
+                # Ensure complete write
+                if bytes_written != len(lock_content):
+                    raise OSError("Partial write to lock file")
+            except Exception:
+                # Write failed - remove corrupt lock file
+                os.close(fd)
+                try:
+                    lock_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+            else:
                 os.close(fd)
         except FileExistsError:
             # Race condition: another process created the lock between our check and create
@@ -2801,9 +2816,17 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                         },
                         "Wait or use shed_force_unlock() / shed_maintenance()"
                     )
-            except (json.JSONDecodeError, FileNotFoundError):
-                # Lock was corrupted or removed - try again
-                lock_path.write_text(json.dumps(lock_data, indent=2))
+            except (json.JSONDecodeError, FileNotFoundError, OSError, PermissionError):
+                # Lock was corrupted, removed, or unreadable - try to claim it
+                try:
+                    lock_path.write_text(json.dumps(lock_data, indent=2))
+                except OSError:
+                    # Cannot write lock file - propagate as storage error
+                    raise StorageError(
+                        "LOCK_ERROR",
+                        "Cannot acquire lock",
+                        hint="Check file permissions"
+                    )
 
     def _check_lock_owner(self, lock_path: Path, user_id: str) -> None:
         """
@@ -2820,8 +2843,8 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                         None,
                         "Only the user who opened the file can save/cancel"
                     )
-            except json.JSONDecodeError:
-                pass  # Corrupted lock, allow operation
+            except (json.JSONDecodeError, OSError, PermissionError):
+                pass  # Corrupted or unreadable lock, allow operation
 
     def _validate_content_size(self, content: str) -> None:
         """Checks that content doesn't exceed max size."""
@@ -7064,11 +7087,22 @@ class Tools:
                                 results = [dict(zip(columns, row)) for row in rows]
                                 truncated = False
                         else:
-                            # limit=0: no limit (user explicitly requested all)
-                            rows = cursor.fetchall()
-                            total_rows = len(rows)
-                            results = [dict(zip(columns, row)) for row in rows] if rows else []
-                            truncated = False
+                            # limit=0: user explicitly requested all, but protect against memory exhaustion
+                            # Use fetchmany with batching up to MAX_SQL_ROWS
+                            results = []
+                            batch_size = 1000
+                            while True:
+                                batch = cursor.fetchmany(batch_size)
+                                if not batch:
+                                    break
+                                for row in batch:
+                                    results.append(dict(zip(columns, row)))
+                                    if len(results) >= MAX_SQL_ROWS:
+                                        break
+                                if len(results) >= MAX_SQL_ROWS:
+                                    break
+                            total_rows = len(results)
+                            truncated = len(results) >= MAX_SQL_ROWS
                     
                     # Build response
                     response_data = {
