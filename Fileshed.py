@@ -5151,6 +5151,7 @@ class Tools:
         filename: str = "",
         import_all: bool = False,
         dest_subdir: str = "",
+        allow_zone_in_path: bool = False,
         __user__: dict = {},
         __metadata__: dict = {},
         __files__: list = None,
@@ -5177,7 +5178,7 @@ class Tools:
             
             if dest_subdir:
                 # Validate dest_subdir
-                dest_subdir = self._core._validate_relative_path(dest_subdir)
+                dest_subdir = self._core._validate_relative_path(dest_subdir, "Uploads", allow_zone_in_path)
                 if dest_subdir:
                     uploads_dir = uploads_dir / dest_subdir
             
@@ -5356,6 +5357,7 @@ class Tools:
         src: str,
         dest: str = "",
         src_zone: str = "",
+        allow_zone_in_path: bool = False,
         __user__: dict = {},
         __metadata__: dict = {},
     ) -> str:
@@ -5419,9 +5421,9 @@ class Tools:
                 src_zone_root = user_root / "Documents" / "data"
 
             # Validate and resolve paths
-            src = self._core._validate_relative_path(src)
+            src = self._core._validate_relative_path(src, src_zone_name, allow_zone_in_path)
             src_path = self._core._resolve_chroot_path(src_zone_root, src)
-            
+
             if not src_path.exists():
                 raise StorageError("FILE_NOT_FOUND", f"ZIP file not found: {src}")
             
@@ -5435,7 +5437,7 @@ class Tools:
             
             # Determine destination
             if dest:
-                dest = self._core._validate_relative_path(dest)
+                dest = self._core._validate_relative_path(dest, zone_name, allow_zone_in_path)
                 dest_path = self._core._resolve_chroot_path(zone_root, dest)
             else:
                 dest_path = src_path.parent
@@ -5515,6 +5517,7 @@ class Tools:
         src: str,
         dest: str = "",
         include_empty_dirs: bool = False,
+        allow_zone_in_path: bool = False,
         __user__: dict = {},
         __metadata__: dict = {},
     ) -> str:
@@ -5548,19 +5551,21 @@ class Tools:
             # Get zone path
             if zone_lower == "storage":
                 zone_root = user_root / "Storage" / "data"
+                zone_name = "Storage"
             else:
                 zone_root = user_root / "Documents" / "data"
-            
+                zone_name = "Documents"
+
             # Validate and resolve source path
-            src = self._core._validate_relative_path(src)
+            src = self._core._validate_relative_path(src, zone_name, allow_zone_in_path)
             src_path = self._core._resolve_chroot_path(zone_root, src)
-            
+
             if not src_path.exists():
                 raise StorageError("FILE_NOT_FOUND", f"Source not found: {src}")
-            
+
             # Determine destination
             if dest:
-                dest = self._core._validate_relative_path(dest)
+                dest = self._core._validate_relative_path(dest, zone_name, allow_zone_in_path)
                 if not dest.endswith('.zip'):
                     dest += '.zip'
                 dest_path = self._core._resolve_chroot_path(zone_root, dest)
@@ -5974,6 +5979,7 @@ class Tools:
         zone: str,
         path: str,
         to: str = "unix",
+        allow_zone_in_path: bool = False,
         __user__: dict = {},
         __metadata__: dict = {},
     ) -> str:
@@ -5996,15 +6002,17 @@ class Tools:
             # Validate zone (not uploads - read-only)
             if zone_lower == "storage":
                 zone_root = user_root / "Storage" / "data"
+                zone_name = "Storage"
             elif zone_lower == "documents":
                 zone_root = user_root / "Documents" / "data"
+                zone_name = "Documents"
             else:
                 raise StorageError(
                     "ZONE_FORBIDDEN",
                     f"Invalid zone for writing: {zone}",
                     hint="Use 'storage' or 'documents'"
                 )
-            
+
             # Validate target format
             to_lower = to.lower()
             if to_lower not in ("unix", "dos", "lf", "crlf"):
@@ -6013,12 +6021,12 @@ class Tools:
                     f"Invalid EOL format: {to}",
                     hint="Use 'unix' (LF) or 'dos' (CRLF)"
                 )
-            
+
             # Normalize format name
             to_unix = to_lower in ("unix", "lf")
-            
+
             # Validate and resolve path
-            path = self._core._validate_relative_path(path)
+            path = self._core._validate_relative_path(path, zone_name, allow_zone_in_path)
             file_path = self._core._resolve_chroot_path(zone_root, path)
             
             if not file_path.exists():
@@ -6223,6 +6231,7 @@ class Tools:
         skip_rows: int = 0,
         has_header: bool = True,
         group: str = None,
+        allow_zone_in_path: bool = False,
         __user__: dict = {},
         __metadata__: dict = {},
     ) -> str:
@@ -6324,12 +6333,15 @@ class Tools:
             # Determine the zone root
             if zone_lower == "uploads":
                 zone_root = user_root / "Uploads" / conv_id
+                zone_name = "Uploads"
                 readonly = True
             elif zone_lower == "storage":
                 zone_root = user_root / "Storage" / "data"
+                zone_name = "Storage"
                 readonly = False
             elif zone_lower == "documents":
                 zone_root = user_root / "Documents" / "data"
+                zone_name = "Documents"
                 readonly = False
             elif zone_lower == "group":
                 if not group:
@@ -6342,6 +6354,7 @@ class Tools:
                 group = self._core._validate_group_id(group)
                 self._core._check_group_access(__user__, group)
                 zone_root = Path(self.valves.storage_base_path) / "groups" / group / "data"
+                zone_name = f"Group:{group}"
                 readonly = False
             else:
                 raise StorageError(
@@ -6349,9 +6362,9 @@ class Tools:
                     f"Invalid zone: {zone}",
                     hint="Use 'uploads', 'storage', 'documents', or 'group'"
                 )
-            
+
             # Validate and resolve path
-            path = self._core._validate_relative_path(path)
+            path = self._core._validate_relative_path(path, zone_name, allow_zone_in_path)
             db_path = self._core._resolve_chroot_path(zone_root, path)
             
             # Ensure parent directory exists
@@ -6394,7 +6407,7 @@ class Tools:
                     )
                 
                 # Resolve CSV path (in same zone)
-                import_csv_path = self._core._validate_relative_path(import_csv)
+                import_csv_path = self._core._validate_relative_path(import_csv, zone_name, allow_zone_in_path)
                 csv_path = self._core._resolve_chroot_path(zone_root, import_csv_path)
                 
                 if not csv_path.exists():
@@ -6821,7 +6834,7 @@ class Tools:
                         # Export all results to CSV file
                         import csv as csv_module
                         
-                        output_csv_path = self._core._validate_relative_path(output_csv)
+                        output_csv_path = self._core._validate_relative_path(output_csv, zone_name, allow_zone_in_path)
                         csv_path = self._core._resolve_chroot_path(zone_root, output_csv_path)
                         self._core._ensure_dir(csv_path.parent)
                         
