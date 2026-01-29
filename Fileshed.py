@@ -3629,26 +3629,30 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
         # === SAFE MODE SETUP ===
         lock_path = None
         working_path = target_path
-        
+
         if safe:
             rel_path = str(target_path.relative_to(zone_root))
             lock_path = editzone_base / "locks" / (rel_path + ".lock")
             edit_path = editzone_base / "editzone" / conv_id / rel_path
-            
+
             self._acquire_lock(lock_path, conv_id, user_id, rel_path)
-            self._ensure_dir(edit_path.parent)
-            
-            if file_exists:
-                shutil.copy2(target_path, edit_path)
-            else:
-                edit_path.touch()
-            working_path = edit_path
+            # NOTE: All operations after lock acquisition must be inside try block
+            # to ensure lock release on failure
         else:
             if file_created:
                 self._ensure_dir(target_path.parent)
                 target_path.touch()
-        
+
         try:
+            # === SAFE MODE EDITZONE SETUP (inside try for lock cleanup) ===
+            if safe:
+                self._ensure_dir(edit_path.parent)
+                if file_exists:
+                    shutil.copy2(target_path, edit_path)
+                else:
+                    edit_path.touch()
+                working_path = edit_path
+
             # === READ CONTENT ===
             if overwrite:
                 lines = []
@@ -3924,26 +3928,30 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
         # === SAFE MODE SETUP ===
         lock_path = None
         working_path = target_path
-        
+
         if safe:
             rel_path = str(target_path.relative_to(zone_root))
             lock_path = editzone_base / "locks" / (rel_path + ".lock")
             edit_path = editzone_base / "editzone" / conv_id / rel_path
-            
+
             self._acquire_lock(lock_path, conv_id, user_id, rel_path)
-            self._ensure_dir(edit_path.parent)
-            
-            if file_exists:
-                shutil.copy2(target_path, edit_path)
-            else:
-                edit_path.touch()
-            working_path = edit_path
+            # NOTE: All operations after lock acquisition must be inside try block
+            # to ensure lock release on failure
         else:
             if file_created:
                 self._ensure_dir(target_path.parent)
                 target_path.touch()
-        
+
         try:
+            # === SAFE MODE EDITZONE SETUP (inside try for lock cleanup) ===
+            if safe:
+                self._ensure_dir(edit_path.parent)
+                if file_exists:
+                    shutil.copy2(target_path, edit_path)
+                else:
+                    edit_path.touch()
+                working_path = edit_path
+
             # === READ DATA ===
             if file_created and not safe:
                 data = bytearray()
@@ -4655,29 +4663,35 @@ class Tools:
             # Create lock
             lock_path = self._core._get_lock_path(ctx.editzone_base, path)
             self._core._acquire_lock(lock_path, ctx.conv_id, user_id, path)
-            
-            # Copy to editzone
-            editzone_path = self._core._get_editzone_path(ctx.editzone_base, ctx.conv_id, path)
-            editzone_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(target, editzone_path)
-            
-            # Read content
+
+            # All operations after lock acquisition must release lock on error
             try:
-                with open(editzone_path, 'r', encoding='utf-8', errors='replace') as f:
-                    content = f.read()
-                is_binary = False
-            except (OSError, UnicodeDecodeError):
-                content = None
-                is_binary = True
-            
-            return self._core._format_response(True, data={
-                "zone": ctx.zone_name,
-                "path": path,
-                "content": content,
-                "is_binary": is_binary,
-                "size": target.stat().st_size,
-                "locked_by": user_id,
-            }, message=f"File opened for editing: {path}")
+                # Copy to editzone
+                editzone_path = self._core._get_editzone_path(ctx.editzone_base, ctx.conv_id, path)
+                editzone_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(target, editzone_path)
+
+                # Read content
+                try:
+                    with open(editzone_path, 'r', encoding='utf-8', errors='replace') as f:
+                        content = f.read()
+                    is_binary = False
+                except (OSError, UnicodeDecodeError):
+                    content = None
+                    is_binary = True
+
+                return self._core._format_response(True, data={
+                    "zone": ctx.zone_name,
+                    "path": path,
+                    "content": content,
+                    "is_binary": is_binary,
+                    "size": target.stat().st_size,
+                    "locked_by": user_id,
+                }, message=f"File opened for editing: {path}")
+            except:
+                # Release lock on any failure after acquisition
+                lock_path.unlink(missing_ok=True)
+                raise
             
         except StorageError as e:
             return self._core._format_error(e, "shed_lockedit_open")
@@ -4881,20 +4895,24 @@ class Tools:
                 else:
                     self._core._check_quota(__user__, size_diff)
             
-            # Copy back to zone
+            # Copy back to zone - if this fails, keep lock for retry
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(editzone_path, target)
-            
-            # Git commit if needed
-            if ctx.git_commit:
-                self._core._git_run(["add", "-A"], ctx.zone_root)
-                commit_msg = message or f"Edit {path}"
-                self._core._git_commit_as_user(ctx.zone_root, commit_msg, user_id)
-            
-            # Cleanup
-            self._core._rm_with_empty_parents(editzone_path, ctx.editzone_base / "editzone")
-            lock_path.unlink(missing_ok=True)
-            
+
+            # Save succeeded - ensure lock is released even if git/cleanup fails
+            try:
+                # Git commit if needed
+                if ctx.git_commit:
+                    self._core._git_run(["add", "-A"], ctx.zone_root)
+                    commit_msg = message or f"Edit {path}"
+                    self._core._git_commit_as_user(ctx.zone_root, commit_msg, user_id)
+
+                # Cleanup editzone
+                self._core._rm_with_empty_parents(editzone_path, ctx.editzone_base / "editzone")
+            finally:
+                # Always release lock after successful save
+                lock_path.unlink(missing_ok=True)
+
             return self._core._format_response(True, data={
                 "zone": ctx.zone_name,
                 "path": path,
