@@ -1575,7 +1575,8 @@ shed_exec(zone="storage", cmd="mkdir", args=["-p", "Storage/backup"], allow_zone
 ```
 
 This parameter is available on: `shed_exec`, `shed_patch_text`, `shed_patch_bytes`,
-`shed_delete`, `shed_rename`, and all `shed_lockedit_*` functions.
+`shed_delete`, `shed_rename`, all `shed_lockedit_*` functions, `shed_copy_to_group`,
+and all `shed_move_*/shed_copy_*` bridge functions.
 
 **Only use this when the user explicitly confirms they want a subfolder with that name.**
 
@@ -4910,24 +4911,30 @@ class Tools:
         self,
         src: str,
         dest: str,
+        allow_zone_in_path: bool = False,
         __user__: dict = {},
         __metadata__: dict = {},
     ) -> str:
         """
         Moves file from Uploads to Storage.
         IMPORTANT: Call shed_import() first to import uploaded files!
-        
-        :param src: Source path in Uploads
-        :param dest: Destination path in Storage
+
+        :param src: Source path in Uploads (don't include zone name!)
+        :param dest: Destination path in Storage (don't include zone name!)
+        :param allow_zone_in_path: Allow paths starting with zone name (default: False)
         :return: Confirmation as JSON
         """
         try:
             user_root = self._core._get_user_root(__user__)
             conv_id = self._core._get_conv_id(__metadata__)
-            
+
+            # Validate paths with zone name check
+            src = self._core._validate_relative_path(src, "Uploads", allow_zone_in_path)
+            dest = self._core._validate_relative_path(dest, "Storage", allow_zone_in_path)
+
             src_chroot = user_root / "Uploads" / conv_id
             dest_chroot = user_root / "Storage" / "data"
-            
+
             source = self._core._resolve_chroot_path(src_chroot, src)
             target = self._core._resolve_chroot_path(dest_chroot, dest)
             
@@ -4958,25 +4965,31 @@ class Tools:
         src: str,
         dest: str,
         message: str = "",
+        allow_zone_in_path: bool = False,
         __user__: dict = {},
         __metadata__: dict = {},
     ) -> str:
         """
         Moves file from Uploads to Documents with Git commit.
         IMPORTANT: Call shed_import() first to import uploaded files!
-        
-        :param src: Source path in Uploads
-        :param dest: Destination path in Documents
+
+        :param src: Source path in Uploads (don't include zone name!)
+        :param dest: Destination path in Documents (don't include zone name!)
         :param message: Commit message
+        :param allow_zone_in_path: Allow paths starting with zone name (default: False)
         :return: Confirmation as JSON
         """
         try:
             user_root = self._core._get_user_root(__user__)
             conv_id = self._core._get_conv_id(__metadata__)
-            
+
+            # Validate paths with zone name check
+            src = self._core._validate_relative_path(src, "Uploads", allow_zone_in_path)
+            dest = self._core._validate_relative_path(dest, "Documents", allow_zone_in_path)
+
             src_chroot = user_root / "Uploads" / conv_id
             dest_chroot = user_root / "Documents" / "data"
-            
+
             source = self._core._resolve_chroot_path(src_chroot, src)
             target = self._core._resolve_chroot_path(dest_chroot, dest)
             
@@ -5014,23 +5027,29 @@ class Tools:
         src: str,
         dest: str,
         message: str = "",
+        allow_zone_in_path: bool = False,
         __user__: dict = {},
         __metadata__: dict = {},
     ) -> str:
         """
         Copies from Storage to Documents with Git commit.
-        
-        :param src: Source path
-        :param dest: Destination path
+
+        :param src: Source path in Storage (don't include zone name!)
+        :param dest: Destination path in Documents (don't include zone name!)
         :param message: Commit message
+        :param allow_zone_in_path: Allow paths starting with zone name (default: False)
         :return: Confirmation as JSON
         """
         try:
             user_root = self._core._get_user_root(__user__)
-            
+
+            # Validate paths with zone name check
+            src = self._core._validate_relative_path(src, "Storage", allow_zone_in_path)
+            dest = self._core._validate_relative_path(dest, "Documents", allow_zone_in_path)
+
             src_chroot = user_root / "Storage" / "data"
             dest_chroot = user_root / "Documents" / "data"
-            
+
             source = self._core._resolve_chroot_path(src_chroot, src)
             target = self._core._resolve_chroot_path(dest_chroot, dest)
             
@@ -5067,23 +5086,29 @@ class Tools:
         src: str,
         dest: str,
         message: str = "",
+        allow_zone_in_path: bool = False,
         __user__: dict = {},
         __metadata__: dict = {},
     ) -> str:
         """
         Moves from Documents to Storage with git rm + commit.
-        
-        :param src: Source path
-        :param dest: Destination path
+
+        :param src: Source path in Documents (don't include zone name!)
+        :param dest: Destination path in Storage (don't include zone name!)
         :param message: Commit message
+        :param allow_zone_in_path: Allow paths starting with zone name (default: False)
         :return: Confirmation as JSON
         """
         try:
             user_root = self._core._get_user_root(__user__)
-            
+
+            # Validate paths with zone name check
+            src = self._core._validate_relative_path(src, "Documents", allow_zone_in_path)
+            dest = self._core._validate_relative_path(dest, "Storage", allow_zone_in_path)
+
             src_chroot = user_root / "Documents" / "data"
             dest_chroot = user_root / "Storage" / "data"
-            
+
             source = self._core._resolve_chroot_path(src_chroot, src)
             target = self._core._resolve_chroot_path(dest_chroot, dest)
             
