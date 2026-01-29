@@ -422,8 +422,8 @@ shed_patch_text(zone="storage", path="projects/2024/.keep", content="")
 2. Click **"+"** or **"Create Tool"** and paste the content of `Fileshed.py`
 3. Save the tool
 4. **Important:** Enable Native Function Calling for your model:
-   - Go to **Admin Panel > Settings > Models > [Select Model] > Advanced Parameters**
-   - Set **Function Calling** to **"Native"**
+   - **Option A (user):** Workspace > Models > [Select Model] > Advanced Parameters > Function Calling > "Native"
+   - **Option B (admin):** Admin Panel > Settings > Models > [Select Model] > Advanced Parameters > Function Calling > "Native"
 5. In a new chat, click the **"+"** button next to the message input and enable **Fileshed**
 
 > ⚠️ **Note:** Tools are different from Functions in Open WebUI:
