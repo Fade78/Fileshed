@@ -2743,10 +2743,7 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                     raise StorageError(
                         "FILE_LOCKED",
                         "File locked by another conversation",
-                        {
-                            "locked_at": existing_lock.get("locked_at"),
-                            "path": existing_lock.get("path"),
-                        },
+                        {"locked_at": existing_lock.get("locked_at")},
                         "Wait or use shed_force_unlock() / shed_maintenance()"
                     )
                 # Same conversation - can proceed (re-lock)
@@ -3621,8 +3618,8 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
                 elif c == 's': flags |= re.DOTALL
             try:
                 compiled_pattern = re.compile(pattern, flags)
-            except re.error as e:
-                raise StorageError("INVALID_PARAMETER", f"Invalid regex: {e}")
+            except re.error:
+                raise StorageError("INVALID_PARAMETER", "Invalid regex pattern", hint="Check regex syntax")
         
         # === CHECK FILE EXISTS ===
         file_exists = target_path.exists()
@@ -3853,8 +3850,8 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
                 content_bytes = content.encode('utf-8')
             else:
                 raise StorageError("INVALID_PARAMETER", f"Invalid content_format: {content_format}")
-        except ValueError as e:
-            raise StorageError("INVALID_PARAMETER", f"Invalid content: {e}")
+        except ValueError:
+            raise StorageError("INVALID_PARAMETER", "Invalid content encoding", hint=f"Content must be valid {content_format}")
 
         # === ZONE RESOLUTION ===
         user_root = self._get_user_root(__user__)
@@ -4529,7 +4526,7 @@ class Tools:
             if ctx.group_id:
                 can_delete, reason = self._core._can_delete_group_file(ctx.group_id, path, user_id)
                 if not can_delete:
-                    raise StorageError("PERMISSION_DENIED", reason, {"path": path})
+                    raise StorageError("PERMISSION_DENIED", reason)
             
             # Delete
             was_dir = target.is_dir()
@@ -4606,7 +4603,7 @@ class Tools:
             if ctx.group_id:
                 can_write, reason = self._core._can_write_group_file(ctx.group_id, old_path, user_id)
                 if not can_write:
-                    raise StorageError("PERMISSION_DENIED", reason, {"path": old_path})
+                    raise StorageError("PERMISSION_DENIED", reason)
             
             # Create parent directories
             new_target.parent.mkdir(parents=True, exist_ok=True)
@@ -4682,8 +4679,8 @@ class Tools:
             if ctx.group_id:
                 can_write, reason = self._core._can_write_group_file(ctx.group_id, path, user_id)
                 if not can_write:
-                    raise StorageError("PERMISSION_DENIED", reason, {"path": path})
-            
+                    raise StorageError("PERMISSION_DENIED", reason)
+
             # Create lock
             lock_path = self._core._get_lock_path(ctx.editzone_base, path)
             self._core._acquire_lock(lock_path, ctx.conv_id, user_id, path)
