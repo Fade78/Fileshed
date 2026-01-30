@@ -9,6 +9,8 @@
 [![Version](https://img.shields.io/badge/version-1.0.3-blue.svg)]()
 [![Open WebUI](https://img.shields.io/badge/Open%20WebUI-Tool-green.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)]()
+[![Tests](https://img.shields.io/badge/tests-1060%20passed-brightgreen.svg)](docs/audits/fileshed/reports/Exec_tests.md)
+[![Audited](https://img.shields.io/badge/audited-★★★★☆-blue.svg)](#testing--audits)
 
 ---
 
@@ -470,6 +472,27 @@ Without this setting, the LLM won't be able to call Fileshed functions correctly
 - **Command whitelist**: Only approved commands allowed
 - **Network disabled by default**: Admin must enable
 - **Quotas**: Storage limits per user and group
+
+---
+
+## Testing & Audits
+
+Fileshed has been independently audited by multiple AI models and validated with comprehensive functional tests.
+
+| Auditor | Rating | Report |
+|---------|:------:|--------|
+| Claude Opus 4.5 | ★★★★☆ (3.75/5) | [Full report](docs/audits/fileshed/reports/anthopic_claude_opus_4.5_thinking.md) |
+| ChatGPT 5.2 Instant | ★★★★☆ (4/5) | [Full report](docs/audits/fileshed/reports/openai_chatgpt_5.2_instant.md) |
+
+**Key strengths identified:**
+- Strong filesystem isolation with symlink detection
+- Defense-in-depth command validation (whitelist + pattern blocking)
+- Comprehensive network exfiltration controls
+- Clean separation between LLM-facing API and internal logic
+
+All issues identified during audits have been addressed.
+
+**Test coverage:** [1060 functional tests](docs/audits/fileshed/reports/Exec_tests.md) — All passing
 
 ---
 

