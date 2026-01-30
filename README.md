@@ -9,7 +9,7 @@
 [![Version](https://img.shields.io/badge/version-1.0.3-blue.svg)]()
 [![Open WebUI](https://img.shields.io/badge/Open%20WebUI-Tool-green.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)]()
-[![Tests](https://img.shields.io/badge/tests-1060%20passed-brightgreen.svg)](docs/audits/fileshed/reports/Exec_tests.md)
+[![Tests](https://img.shields.io/badge/tests-1084%20passed-brightgreen.svg)](docs/audits/fileshed/reports/Exec_tests.md)
 [![Audited](https://img.shields.io/badge/audited-★★★★☆-blue.svg)](#testing--audits)
 
 ---
@@ -494,7 +494,7 @@ Fileshed has been independently audited by multiple AI models and validated with
 
 All issues identified during audits have been addressed.
 
-**Test coverage:** [1060 functional tests](docs/audits/fileshed/reports/Exec_tests.md) — All passing
+**Test coverage:** [1084 functional tests](docs/audits/fileshed/reports/Exec_tests.md) — All passing
 
 ---
 
