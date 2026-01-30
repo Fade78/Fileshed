@@ -2565,6 +2565,13 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
 
     def _calculate_effective_max(self, max_output: int) -> int:
         """Calculate effective max output size based on user parameter and valve limits."""
+        # LLM Guardrail: validate type before use
+        if max_output is not None and not isinstance(max_output, int):
+            raise StorageError(
+                "INVALID_PARAMETER",
+                f"max_output must be an integer or None, got: {repr(max_output)} ({type(max_output).__name__})",
+                hint="Omit max_output or use an integer like max_output=50000"
+            )
         if max_output is None:
             return self.valves.max_output_default
         elif max_output == 0:
@@ -2768,6 +2775,9 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                 {"command": cmd},
                 "Use shed_allowed_commands() to see available commands"
             )
+        except StorageError:
+            # Re-raise StorageError (e.g., from _calculate_effective_max validation)
+            raise
         except Exception:
             raise StorageError(
                 "EXEC_ERROR",
@@ -3365,6 +3375,13 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
 
     def _clamp_timeout(self, timeout: int = None) -> int:
         """Clamps timeout to configured values. Uses exec_timeout_default if not specified."""
+        # LLM Guardrail: validate type before use
+        if timeout is not None and not isinstance(timeout, int):
+            raise StorageError(
+                "INVALID_PARAMETER",
+                f"timeout must be an integer or None, got: {repr(timeout)} ({type(timeout).__name__})",
+                hint="Omit timeout or use an integer like timeout=30"
+            )
         if timeout is None:
             timeout = self.valves.exec_timeout_default
         return max(1, min(timeout, self.valves.exec_timeout_max))
@@ -3769,6 +3786,20 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
         
         # Skip line/end_line/pattern validation when overwrite=True (these params are ignored)
         if not overwrite:
+            # LLM Guardrail: validate types before comparison
+            if line is not None and not isinstance(line, int):
+                raise StorageError(
+                    "INVALID_PARAMETER",
+                    f"line must be an integer or None, got: {repr(line)} ({type(line).__name__})",
+                    hint="Use line=1 for first line, line=2 for second, etc."
+                )
+            if end_line is not None and not isinstance(end_line, int):
+                raise StorageError(
+                    "INVALID_PARAMETER",
+                    f"end_line must be an integer or None, got: {repr(end_line)} ({type(end_line).__name__})",
+                    hint="Use end_line=5 to replace lines up to line 5"
+                )
+
             # Validate line parameter - line=0 is explicitly invalid
             if line is not None and line < 1:
                 raise StorageError("INVALID_PARAMETER", "Line must be >= 1 (first line is 1, not 0)")
@@ -3791,6 +3822,13 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
         if pattern is not None and not overwrite:
             if pattern == "":
                 raise StorageError("INVALID_PARAMETER", "Pattern cannot be empty")
+            # LLM Guardrail: validate regex_flags type
+            if not isinstance(regex_flags, str):
+                raise StorageError(
+                    "INVALID_PARAMETER",
+                    f"regex_flags must be a string, got: {repr(regex_flags)} ({type(regex_flags).__name__})",
+                    hint="Use regex_flags='i' for case-insensitive, 'im' for multiline, or '' for none"
+                )
             flags = 0
             for c in regex_flags.lower():
                 if c == 'i': flags |= re.IGNORECASE
@@ -4103,13 +4141,27 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
         
         if position in ("at", "replace") and offset is None:
             raise StorageError("MISSING_PARAMETER", f"Position '{position}' requires 'offset'")
-        
+
         if position == "replace" and length is None:
             raise StorageError("MISSING_PARAMETER", "Position 'replace' requires 'length'")
-        
+
+        # LLM Guardrail: validate types before comparison
+        if offset is not None and not isinstance(offset, int):
+            raise StorageError(
+                "INVALID_PARAMETER",
+                f"offset must be an integer or None, got: {repr(offset)} ({type(offset).__name__})",
+                hint="Use offset=0 for start of file, offset=100 for byte 100, etc."
+            )
+        if length is not None and not isinstance(length, int):
+            raise StorageError(
+                "INVALID_PARAMETER",
+                f"length must be an integer or None, got: {repr(length)} ({type(length).__name__})",
+                hint="Use length=10 to replace 10 bytes"
+            )
+
         if offset is not None and offset < 0:
             raise StorageError("INVALID_PARAMETER", "Offset must be >= 0")
-        
+
         if length is not None and length < 0:
             raise StorageError("INVALID_PARAMETER", "Length must be >= 0")
         
@@ -6550,6 +6602,14 @@ class Tools:
             zone_root = ctx.zone_root
             zone_name = ctx.zone_name
 
+            # LLM Guardrail: validate type before use
+            if not isinstance(to, str):
+                raise StorageError(
+                    "INVALID_PARAMETER",
+                    f"to must be a string ('unix' or 'dos'), got: {repr(to)} ({type(to).__name__})",
+                    hint="Use to='unix' for LF line endings or to='dos' for CRLF (Windows)"
+                )
+
             # Validate target format
             to_lower = to.lower()
             if to_lower not in ("unix", "dos", "lf", "crlf"):
@@ -6674,7 +6734,25 @@ class Tools:
 
             if file_path.is_dir():
                 raise StorageError("INVALID_FORMAT", "Cannot hexdump directory")
-            
+
+            # LLM Guardrail: convert None to defaults, validate types
+            if offset is None:
+                offset = 0
+            elif not isinstance(offset, int):
+                raise StorageError(
+                    "INVALID_PARAMETER",
+                    f"offset must be an integer or None, got: {repr(offset)} ({type(offset).__name__})",
+                    hint="Use offset=0 for start of file, or omit for default"
+                )
+            if length is None:
+                length = DEFAULT_HEXDUMP_BYTES
+            elif not isinstance(length, int):
+                raise StorageError(
+                    "INVALID_PARAMETER",
+                    f"length must be an integer or None, got: {repr(length)} ({type(length).__name__})",
+                    hint="Use length=256 or omit for default"
+                )
+
             # Clamp values
             offset = max(0, offset)
             length = max(1, min(length, MAX_HEXDUMP_BYTES))
@@ -6879,6 +6957,16 @@ class Tools:
             # CSV IMPORT MODE
             # =====================================================
             if import_csv:
+                # LLM Guardrail: convert skip_rows=None to 0
+                if skip_rows is None:
+                    skip_rows = 0
+                elif not isinstance(skip_rows, int):
+                    raise StorageError(
+                        "INVALID_PARAMETER",
+                        f"skip_rows must be an integer, got: {repr(skip_rows)} ({type(skip_rows).__name__})",
+                        hint="Use skip_rows=0 (default) or skip_rows=2 to skip 2 rows"
+                    )
+
                 # Validate parameters
                 if not table:
                     raise StorageError(
@@ -6886,7 +6974,7 @@ class Tools:
                         "table parameter required for CSV import",
                         hint="Add table='tablename' parameter"
                     )
-                
+
                 if if_exists not in ("fail", "replace", "append"):
                     raise StorageError(
                         "INVALID_PARAMETER",

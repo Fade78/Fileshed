@@ -533,6 +533,38 @@ This section documents deliberate design decisions and their justifications. It 
 - **No system data in errors.** Error messages never expose internal identifiers, UUIDs, or absolute disk paths. Only user-facing information is returned.
 - **LLM-oriented documentation.** All functions include detailed docstrings and contextual error hints to help even small LLMs understand correct usage patterns.
 
+### LLM Guardrails
+
+Each tool call is expensive (API latency, token consumption, context pollution). The goal is to **minimize round-trips** between the LLM and the tool by making errors self-correcting.
+
+**When documentation fails, error messages must succeed.**
+
+An error response must include:
+1. **The faulty parameter name** — so the LLM knows what to fix
+2. **The received value** (with type if ambiguous) — so the LLM sees what it passed
+3. **The expected format** — so the LLM knows how to correct it
+4. **A concrete example** in the hint — so even a small LLM (8B) can copy-paste
+
+Example of a **bad** error (causes retry loops):
+```json
+{"error": "EXEC_ERROR", "message": "Execution error", "hint": null}
+```
+
+Example of a **good** error (self-correcting):
+```json
+{
+  "error": "INVALID_PARAMETER",
+  "message": "max_output must be an integer or None, got: '' (empty string)",
+  "hint": "Omit max_output or use an integer like max_output=50000"
+}
+```
+
+**Type coercion rules:**
+- Falsy values for optional list parameters (`args=0`, `args=""`) are silently converted to `[]`
+- Falsy values for optional string parameters (`message=""`) use the default value
+- Invalid types for numeric parameters (`line=""`, `offset=""`) raise `INVALID_PARAMETER` with the parameter name
+- `overwrite=True` silently ignores positioning parameters (`line`, `end_line`, `pattern`) to avoid spurious errors
+
 ### Performance and Quotas
 
 - **No quota caching.** Every write operation recalculates disk usage in real-time (O(n) files). This is intentional: simplicity and reliability over performance. A cache would introduce invalidation problems, undetected quota overruns, and subtle bugs. The usage context (LLM tool, not high-performance filesystem) doesn't justify the complexity.
