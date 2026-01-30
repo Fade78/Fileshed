@@ -99,6 +99,10 @@ BYTES_PER_MB = 1024 * 1024
 ZIP_MAX_DECOMPRESSED_SIZE = 500 * BYTES_PER_MB  # 500 MB max decompressed
 ZIP_MAX_FILES = 10000                            # Max files in archive
 ZIP_MAX_COMPRESSION_RATIO = 100                  # Max compression ratio (100:1)
+ZIP_MAGIC_BYTES = (b'PK\x03\x04', b'PK\x05\x06', b'PK\x07\x08')  # Valid ZIP signatures
+
+# CSV protection limits
+CSV_MAX_COLUMNS = 5000  # Prevent DoS with extremely wide CSV files
 
 # Output limits
 MAX_HEXDUMP_BYTES = 4096
@@ -5877,7 +5881,18 @@ class Tools:
                     {"file": src},
                     "Only .zip files are supported"
                 )
-            
+
+            # Verify ZIP magic bytes (not just extension)
+            with open(src_path, 'rb') as f:
+                header = f.read(4)
+            if not any(header.startswith(magic) for magic in ZIP_MAGIC_BYTES):
+                raise StorageError(
+                    "INVALID_FORMAT",
+                    "File has .zip extension but is not a valid ZIP archive",
+                    {"file": src},
+                    "The file header does not match ZIP format"
+                )
+
             # Determine destination
             if dest:
                 dest = self._core._validate_relative_path(dest, zone_name, allow_zone_in_path)
@@ -6311,7 +6326,18 @@ class Tools:
                     "File is not a ZIP archive",
                     hint="Only .zip files are supported"
                 )
-            
+
+            # Verify ZIP magic bytes (not just extension)
+            with open(zip_path, 'rb') as f:
+                header = f.read(4)
+            if not any(header.startswith(magic) for magic in ZIP_MAGIC_BYTES):
+                raise StorageError(
+                    "INVALID_FORMAT",
+                    "File has .zip extension but is not a valid ZIP archive",
+                    {"file": path},
+                    "The file header does not match ZIP format"
+                )
+
             # Read ZIP info
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 files = []
@@ -6990,7 +7016,16 @@ class Tools:
                                     clean = '_' + clean
                                 clean_columns.append(clean)
                             df.columns = clean_columns
-                        
+
+                        # Check column count limit (DoS protection)
+                        if len(df.columns) > CSV_MAX_COLUMNS:
+                            raise StorageError(
+                                "CSV_TOO_WIDE",
+                                f"CSV has too many columns ({len(df.columns)})",
+                                {"columns": len(df.columns), "max": CSV_MAX_COLUMNS},
+                                f"Maximum {CSV_MAX_COLUMNS} columns allowed"
+                            )
+
                         # Import to SQLite
                         pandas_if_exists = 'append' if if_exists == 'append' and table_exists else 'replace'
                         df.to_sql(table, conn, if_exists=pandas_if_exists, index=False)
@@ -7064,7 +7099,16 @@ class Tools:
                                     )
                                 clean_headers = [f"col_{i+1}" for i in range(len(first_data_row))]
                                 import_info['generated_columns'] = True
-                            
+
+                            # Check column count limit (DoS protection)
+                            if len(clean_headers) > CSV_MAX_COLUMNS:
+                                raise StorageError(
+                                    "CSV_TOO_WIDE",
+                                    f"CSV has too many columns ({len(clean_headers)})",
+                                    {"columns": len(clean_headers), "max": CSV_MAX_COLUMNS},
+                                    f"Maximum {CSV_MAX_COLUMNS} columns allowed"
+                                )
+
                             # Create table if needed
                             if not table_exists or if_exists == "replace":
                                 columns_def = ", ".join(f'"{col}" TEXT' for col in clean_headers)
