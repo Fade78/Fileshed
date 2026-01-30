@@ -739,36 +739,45 @@ class _FileshedCore:
             ],
         },
         "shed_move_uploads_to_storage": {
-            "usage": "shed_move_uploads_to_storage(src, dest)",
+            "usage": "shed_move_uploads_to_storage(src, dest, overwrite=False)",
             "desc": "Move file from Uploads to Storage",
             "workflows": ["Upload Handling", "File Operations"],
             "howtos": ["upload"],
             "not_for": ["Locked Edit workflow"],
-            "tips": ["Uploads zone is read-only, move files to Storage for editing"],
+            "tips": [
+                "Uploads zone is read-only, move files to Storage for editing",
+                "overwrite=True to replace existing destination file",
+            ],
         },
         "shed_move_uploads_to_documents": {
-            "usage": "shed_move_uploads_to_documents(src, dest, message=None)",
+            "usage": "shed_move_uploads_to_documents(src, dest, message=None, overwrite=False)",
             "desc": "Move file from Uploads to Documents (versioned)",
             "workflows": ["Upload Handling", "File Operations"],
             "howtos": ["upload"],
             "not_for": ["Locked Edit workflow"],
-            "tips": ["Documents zone has Git versioning"],
+            "tips": [
+                "Documents zone has Git versioning",
+                "overwrite=True to replace existing destination file",
+            ],
         },
         "shed_copy_storage_to_documents": {
-            "usage": "shed_copy_storage_to_documents(src, dest, message=None)",
+            "usage": "shed_copy_storage_to_documents(src, dest, message=None, overwrite=False)",
             "desc": "Copy file from Storage to Documents (versioned)",
             "workflows": ["File Operations"],
             "howtos": ["upload"],
             "not_for": ["Locked Edit workflow"],
-            "tips": [],
+            "tips": ["overwrite=True to replace existing destination file"],
         },
         "shed_move_documents_to_storage": {
-            "usage": "shed_move_documents_to_storage(src, dest, message=None)",
+            "usage": "shed_move_documents_to_storage(src, dest, message=None, overwrite=False)",
             "desc": "Move file from Documents to Storage (removes versioning)",
             "workflows": ["File Operations"],
             "howtos": ["upload"],
             "not_for": ["Locked Edit workflow"],
-            "tips": ["message: Git commit message for the removal from Documents"],
+            "tips": [
+                "message: Git commit message for the removal from Documents",
+                "overwrite=True to replace existing destination file",
+            ],
         },
         
         # === LINKS ===
@@ -819,12 +828,12 @@ class _FileshedCore:
             "tips": [],
         },
         "shed_copy_to_group": {
-            "usage": "shed_copy_to_group(src_zone, src_path, group, dest_path, message=None)",
+            "usage": "shed_copy_to_group(src_zone, src_path, group, dest_path, message=None, overwrite=False)",
             "desc": "Copy file to a group",
             "workflows": ["Collaboration", "File Operations"],
             "howtos": [],
             "not_for": ["Locked Edit workflow", "Direct Write workflow"],
-            "tips": [],
+            "tips": ["overwrite=True to replace existing destination file"],
         },
         
         # === ZIP ===
@@ -5443,6 +5452,7 @@ class Tools:
         self,
         src: str,
         dest: str,
+        overwrite: bool = False,
         allow_zone_in_path: bool = False,
         __user__: dict = None,
         __metadata__: dict = None,
@@ -5453,6 +5463,7 @@ class Tools:
 
         :param src: Source path in Uploads (don't include zone name!)
         :param dest: Destination path in Storage (don't include zone name!)
+        :param overwrite: If True, overwrite existing destination file (default: False)
         :param allow_zone_in_path: Allow paths starting with zone name (default: False)
         :return: Confirmation as JSON
         """
@@ -5489,11 +5500,21 @@ class Tools:
                     "FILE_NOT_FOUND",
                     f"File not found in Uploads: {src}",
                     {"path": src},
-                    "Did you call shed_import(import_all=True) first? Files must be imported before moving."
+                    "Did you call shed_import() first? Files must be imported before moving."
                 )
 
             if target.exists():
-                raise StorageError("FILE_EXISTS", f"Destination exists: {dest}")
+                if overwrite:
+                    if target.is_dir():
+                        shutil.rmtree(str(target))
+                    else:
+                        target.unlink()
+                else:
+                    raise StorageError(
+                        "FILE_EXISTS",
+                        f"Destination exists: {dest}",
+                        hint="Use overwrite=True to replace the existing file"
+                    )
 
             # No quota check needed: move within user space doesn't change total usage
 
@@ -5514,6 +5535,7 @@ class Tools:
         src: str,
         dest: str,
         message: str = None,
+        overwrite: bool = False,
         allow_zone_in_path: bool = False,
         __user__: dict = None,
         __metadata__: dict = None,
@@ -5525,6 +5547,7 @@ class Tools:
         :param src: Source path in Uploads (don't include zone name!)
         :param dest: Destination path in Documents (don't include zone name!)
         :param message: Commit message
+        :param overwrite: If True, overwrite existing destination file (default: False)
         :param allow_zone_in_path: Allow paths starting with zone name (default: False)
         :return: Confirmation as JSON
         """
@@ -5561,11 +5584,21 @@ class Tools:
                     "FILE_NOT_FOUND",
                     f"File not found in Uploads: {src}",
                     {"path": src},
-                    "Did you call shed_import(import_all=True) first? Files must be imported before moving."
+                    "Did you call shed_import() first? Files must be imported before moving."
                 )
 
             if target.exists():
-                raise StorageError("FILE_EXISTS", f"Destination exists: {dest}")
+                if overwrite:
+                    if target.is_dir():
+                        shutil.rmtree(str(target))
+                    else:
+                        target.unlink()
+                else:
+                    raise StorageError(
+                        "FILE_EXISTS",
+                        f"Destination exists: {dest}",
+                        hint="Use overwrite=True to replace the existing file"
+                    )
 
             # No quota check needed: move within user space doesn't change total usage
 
@@ -5575,7 +5608,7 @@ class Tools:
             self._core._ensure_dir(target.parent)
 
             shutil.move(str(source), str(target))
-            
+
             # Commit
             if not message:
                 message = f"Import {src}"
@@ -5593,6 +5626,7 @@ class Tools:
         src: str,
         dest: str,
         message: str = None,
+        overwrite: bool = False,
         allow_zone_in_path: bool = False,
         __user__: dict = None,
         __metadata__: dict = None,
@@ -5603,6 +5637,7 @@ class Tools:
         :param src: Source path in Storage (don't include zone name!)
         :param dest: Destination path in Documents (don't include zone name!)
         :param message: Commit message
+        :param overwrite: If True, overwrite existing destination file (default: False)
         :param allow_zone_in_path: Allow paths starting with zone name (default: False)
         :return: Confirmation as JSON
         """
@@ -5637,7 +5672,17 @@ class Tools:
                 raise StorageError("FILE_NOT_FOUND", f"File not found: {src}")
 
             if target.exists():
-                raise StorageError("FILE_EXISTS", f"Destination exists: {dest}")
+                if overwrite:
+                    if target.is_dir():
+                        shutil.rmtree(str(target))
+                    else:
+                        target.unlink()
+                else:
+                    raise StorageError(
+                        "FILE_EXISTS",
+                        f"Destination exists: {dest}",
+                        hint="Use overwrite=True to replace the existing file"
+                    )
 
             # Check quota before copy
             self._core._check_quota(__user__, self._core._get_path_size(source))
@@ -5651,12 +5696,12 @@ class Tools:
                 shutil.copytree(source, target)
             else:
                 shutil.copy2(source, target)
-            
+
             # Commit
             if not message:
                 message = f"Import from Storage: {src}"
             self._core._git_commit(dest_chroot, message)
-            
+
             return self._core._format_response(True, message=f"Copied and committed: Storage/{src} -> Documents/{dest}")
             
         except StorageError as e:
@@ -5669,6 +5714,7 @@ class Tools:
         src: str,
         dest: str,
         message: str = None,
+        overwrite: bool = False,
         allow_zone_in_path: bool = False,
         __user__: dict = None,
         __metadata__: dict = None,
@@ -5679,6 +5725,7 @@ class Tools:
         :param src: Source path in Documents (don't include zone name!)
         :param dest: Destination path in Storage (don't include zone name!)
         :param message: Commit message
+        :param overwrite: If True, overwrite existing destination file (default: False)
         :param allow_zone_in_path: Allow paths starting with zone name (default: False)
         :return: Confirmation as JSON
         """
@@ -5713,7 +5760,17 @@ class Tools:
                 raise StorageError("FILE_NOT_FOUND", f"File not found: {src}")
 
             if target.exists():
-                raise StorageError("FILE_EXISTS", f"Destination exists: {dest}")
+                if overwrite:
+                    if target.is_dir():
+                        shutil.rmtree(str(target))
+                    else:
+                        target.unlink()
+                else:
+                    raise StorageError(
+                        "FILE_EXISTS",
+                        f"Destination exists: {dest}",
+                        hint="Use overwrite=True to replace the existing file"
+                    )
 
             # Check quota (move requires temporary duplication)
             self._core._check_quota(__user__, self._core._get_path_size(source))
@@ -5726,15 +5783,15 @@ class Tools:
                 shutil.copytree(source, target)
             else:
                 shutil.copy2(source, target)
-            
+
             # git rm in Documents via Layer 2
             self._core._git_run(["rm", "-rf", src], src_chroot)
-            
+
             # Commit
             if not message:
                 message = f"Move to Storage: {src}"
             self._core._git_commit(src_chroot, message)
-            
+
             return self._core._format_response(True, message=f"Moved: Documents/{src} -> Storage/{dest}")
             
         except StorageError as e:
@@ -8840,6 +8897,7 @@ shed_tree(zone="storage") # Directory tree
         dest_path: str,
         message: str = "Add file to group",
         mode: str = None,
+        overwrite: bool = False,
         allow_zone_in_path: bool = False,
         __user__: dict = None,
         __metadata__: dict = None,
@@ -8853,6 +8911,7 @@ shed_tree(zone="storage") # Directory tree
         :param dest_path: Destination path in group (don't include zone name!)
         :param message: Git commit message
         :param mode: Write mode: 'owner', 'group', or 'owner_ro' (default from config)
+        :param overwrite: If True, overwrite existing destination file (default: False)
         :param allow_zone_in_path: Allow paths starting with zone name (default: False)
         :return: Operation result as JSON
         """
@@ -8916,7 +8975,17 @@ shed_tree(zone="storage") # Directory tree
 
             # Check if destination exists
             if dest.exists():
-                raise StorageError("FILE_EXISTS", f"Destination exists: {dest_path}")
+                if overwrite:
+                    if dest.is_dir():
+                        shutil.rmtree(str(dest))
+                    else:
+                        dest.unlink()
+                else:
+                    raise StorageError(
+                        "FILE_EXISTS",
+                        f"Destination exists: {dest_path}",
+                        hint="Use overwrite=True to replace the existing file"
+                    )
 
             existing = self._core._get_file_ownership(group, dest_path)
             if existing:

@@ -9,7 +9,7 @@
 [![Version](https://img.shields.io/badge/version-1.0.3-blue.svg)]()
 [![Open WebUI](https://img.shields.io/badge/Open%20WebUI-Tool-green.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)]()
-[![Tests](https://img.shields.io/badge/tests-1091%20passed-brightgreen.svg)](docs/audits/fileshed/reports/Exec_tests.md)
+[![Tests](https://img.shields.io/badge/tests-1101%20passed-brightgreen.svg)](docs/audits/fileshed/reports/Exec_tests.md)
 [![Audited](https://img.shields.io/badge/audited-★★★★☆-blue.svg)](#testing--audits)
 
 ---
@@ -382,11 +382,11 @@ shed_patch_text(zone="storage", path="projects/2024/.keep", content="")
 
 | Function | Description |
 |----------|-------------|
-| `shed_move_uploads_to_storage(src, dest)` | Move from Uploads to Storage |
-| `shed_move_uploads_to_documents(src, dest, message=None)` | Move from Uploads to Documents |
-| `shed_copy_storage_to_documents(src, dest, message=None)` | Copy from Storage to Documents |
-| `shed_move_documents_to_storage(src, dest, message=None)` | Move from Documents to Storage |
-| `shed_copy_to_group(src_zone, src_path, group, dest_path, message=None, mode=None)` | Copy to a group |
+| `shed_move_uploads_to_storage(src, dest, overwrite=False)` | Move from Uploads to Storage |
+| `shed_move_uploads_to_documents(src, dest, message=None, overwrite=False)` | Move from Uploads to Documents |
+| `shed_copy_storage_to_documents(src, dest, message=None, overwrite=False)` | Copy from Storage to Documents |
+| `shed_move_documents_to_storage(src, dest, message=None, overwrite=False)` | Move from Documents to Storage |
+| `shed_copy_to_group(src_zone, src_path, group, dest_path, message=None, mode=None, overwrite=False)` | Copy to a group |
 
 ### Archives (3 functions)
 
@@ -494,7 +494,7 @@ Fileshed has been independently audited by multiple AI models and validated with
 
 All issues identified during audits have been addressed.
 
-**Test coverage:** [1091 functional tests](docs/audits/fileshed/reports/Exec_tests.md) — All passing
+**Test coverage:** [1101 functional tests](docs/audits/fileshed/reports/Exec_tests.md) — All passing
 
 ---
 

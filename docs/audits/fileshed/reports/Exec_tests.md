@@ -1,7 +1,7 @@
 # Fileshed Test Execution Report
 
 **Version**: 1.0.3
-**Tests executed**: 1091/1091
+**Tests executed**: 1101/1101
 **Result**: ✅ ALL PASSED
 
 ---
@@ -1099,3 +1099,13 @@
 | TEST-1089 | ✅ | detach minuscules (bloqué sécurité) | `shed_sqlite(zone="storage", path="db.db", que...` | COMMAND_FORBIDDEN |
 | TEST-1090 | ✅ | load_extension minuscules (bloqué sécurité) | `shed_sqlite(zone="storage", path="db.db", que...` | COMMAND_FORBIDDEN |
 | TEST-1091 | ✅ | Attach DATABASE casse mixte (bloqué sécurité) | `shed_sqlite(zone="storage", path="db.db", que...` | COMMAND_FORBIDDEN |
+| TEST-1092 | ✅ | shed_move_uploads_to_storage sans overwrite sur fi... | `shed_move_uploads_to_storage(src="overwrite_s...` | FILE_EXISTS |
+| TEST-1093 | ✅ | shed_move_uploads_to_storage avec overwrite=True s... | `shed_move_uploads_to_storage(src="overwrite_s...` | ✓ success |
+| TEST-1094 | ✅ | shed_copy_storage_to_documents sans overwrite sur ... | `shed_copy_storage_to_documents(src="readme.tx...` | FILE_EXISTS |
+| TEST-1095 | ✅ | shed_copy_storage_to_documents avec overwrite=True... | `shed_copy_storage_to_documents(src="readme.tx...` | ✓ success |
+| TEST-1096 | ✅ | shed_move_documents_to_storage sans overwrite sur ... | `shed_move_documents_to_storage(src="overwrite...` | FILE_EXISTS |
+| TEST-1097 | ✅ | shed_move_documents_to_storage avec overwrite=True... | `shed_move_documents_to_storage(src="overwrite...` | ✓ success |
+| TEST-1098 | ✅ | shed_move_uploads_to_documents sans overwrite sur ... | `shed_move_uploads_to_documents(src="overwrite...` | FILE_EXISTS |
+| TEST-1099 | ✅ | shed_move_uploads_to_documents avec overwrite=True... | `shed_move_uploads_to_documents(src="overwrite...` | ✓ success |
+| TEST-1100 | ✅ | shed_copy_to_group sans overwrite sur fichier exis... | `shed_copy_to_group(src_zone="storage", src_pa...` | FILE_EXISTS |
+| TEST-1101 | ✅ | shed_copy_to_group avec overwrite=True sur fichier... | `shed_copy_to_group(src_zone="storage", src_pa...` | ✓ success |
