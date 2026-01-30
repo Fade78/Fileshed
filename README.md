@@ -101,6 +101,28 @@ Fileshed gives your LLM a persistent workspace. It provides:
 
 ---
 
+## Installation
+
+1. In Open WebUI, go to **Workspace > Tools**
+2. Click **"+"** or **"Create Tool"** and paste the content of `Fileshed.py`
+3. Save the tool
+4. In a new chat, click the **"+"** button next to the message input and enable **Fileshed**
+
+> ℹ️ **Note:** Tools are in **Workspace > Tools**, not Admin Panel. Functions (Admin Panel) are different — they extend the platform itself.
+
+---
+
+## Model Configuration (Required)
+
+For Fileshed to work properly, your model must have **Native Function Calling** enabled:
+
+- **User level:** Workspace > Models > [Select Model] > Advanced Parameters > Function Calling > "Native"
+- **Admin level:** Admin Panel > Settings > Models > [Select Model] > Advanced Parameters > Function Calling > "Native"
+
+Without this setting, the LLM won't be able to call Fileshed functions correctly.
+
+---
+
 ## How It Works
 
 Fileshed provides four storage zones:
@@ -418,28 +440,6 @@ shed_patch_text(zone="storage", path="projects/2024/.keep", content="")
 | `shed_maintenance()` | Cleanup expired locks |
 
 **Total: 37 functions**
-
----
-
-## Installation
-
-1. In Open WebUI, go to **Workspace > Tools**
-2. Click **"+"** or **"Create Tool"** and paste the content of `Fileshed.py`
-3. Save the tool
-4. In a new chat, click the **"+"** button next to the message input and enable **Fileshed**
-
-> ℹ️ **Note:** Tools are in **Workspace > Tools**, not Admin Panel. Functions (Admin Panel) are different — they extend the platform itself.
-
----
-
-## Model Configuration (Required)
-
-For Fileshed to work properly, your model must have **Native Function Calling** enabled:
-
-- **User level:** Workspace > Models > [Select Model] > Advanced Parameters > Function Calling > "Native"
-- **Admin level:** Admin Panel > Settings > Models > [Select Model] > Advanced Parameters > Function Calling > "Native"
-
-Without this setting, the LLM won't be able to call Fileshed functions correctly.
 
 ---
 
