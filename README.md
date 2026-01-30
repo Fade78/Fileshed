@@ -481,7 +481,7 @@ Fileshed has been independently audited by multiple AI models and validated with
 
 | Auditor | Rating | Report |
 |---------|:------:|--------|
-| Claude Opus 4.5 | ★★★★☆ (3.75/5) | [Full report](docs/audits/fileshed/reports/anthopic_claude_opus_4.5_thinking.md) |
+| Claude Opus 4.5 (Thinking) | ★★★★☆ (3.75/5) | [Full report](docs/audits/fileshed/reports/anthopic_claude_opus_4.5_thinking.md) |
 | ChatGPT 5.2 Instant | ★★★★☆ (4/5) | [Full report](docs/audits/fileshed/reports/openai_chatgpt_5.2_instant.md) |
 
 **Key strengths identified:**
