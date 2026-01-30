@@ -125,7 +125,7 @@ All internal methods are in a separate `_FileshedCore` class, preventing the LLM
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                  class Tools (PUBLIC API)                       │
-│              async def shed_*() — 37 functions                  │
+│              async def shed_*() — 38 functions                  │
 │                                                                 │
 │  These are the ONLY functions visible to the LLM.               │
 │  Handle: parameter validation, zone resolution, response format │
@@ -221,9 +221,10 @@ Some parameters only apply to certain zones and are ignored otherwise:
 
 ### Function Categories
 
-**Core Operations (10 functions):**
+**Core Operations (11 functions):**
 
 - `shed_exec` — Execute shell commands (including reading files with cat/head/tail, stdout_file= for output redirection)
+- `shed_create_file` — Create or overwrite files (wrapper for patch functions, intuitive to use)
 - `shed_patch_text` — Write/create text files (THE standard write function)
 - `shed_patch_bytes` — Write binary data to files
 - `shed_delete` — Delete files/folders
@@ -276,7 +277,7 @@ Some parameters only apply to certain zones and are ignored otherwise:
 - `shed_allowed_commands` — List allowed shell commands
 - `shed_maintenance` — Cleanup expired locks
 
-**Total: 37 functions**
+**Total: 38 functions**
 
 ## Group permissions
 
@@ -339,20 +340,38 @@ Commands are separated into two whitelists:
 
 **WHITELIST_READONLY** (for Uploads zone):
 
-- `cat`, `head`, `tail`, `less`, `more`
-- `ls`, `find`, `tree`, `stat`, `file`
-- `grep`, `wc`, `diff`, `sort`, `uniq`
-- `md5sum`, `sha256sum`, `base64`
-- `hexdump`, `xxd`, `strings`, `od`
+Reading: `cat`, `head`, `tail`, `less`, `more`, `nl`, `wc`, `stat`, `file`, `du`, `tac`
+Navigation: `ls`, `tree`, `find`
+Text search: `grep`, `egrep`, `fgrep`, `rg`, `awk`, `sed`
+Text transformation: `sort`, `uniq`, `cut`, `paste`, `tr`, `fold`, `fmt`, `column`, `rev`, `shuf`, `expand`, `unexpand`, `pr`, `join`
+Comparison: `diff`, `diff3`, `cmp`, `comm`
+Archives (list): `tar`, `unzip`, `zipinfo`, `7z`
+Compression (stdout): `zcat`, `bzcat`, `xzcat`
+Checksums: `md5sum`, `sha1sum`, `sha256sum`, `sha512sum`, `b2sum`, `cksum`
+Encoding: `base32`, `base64`, `basenc`
+Binary/Hex: `strings`, `od`, `hexdump`, `xxd`
+JSON/XML/YAML: `jq`, `xmllint`, `yq`
+Misc: `iconv`, `bc`, `dc`, `expr`, `factor`, `numfmt`, `basename`, `dirname`, `realpath`, `echo`, `printf`
+Media info: `ffprobe`, `identify`, `exiftool`
+Database: `sqlite3`
 
 **WHITELIST_READWRITE** (for Storage, Documents, Groups):
 
-- All of READONLY plus:
-- `cp`, `mv`, `rm`, `mkdir`, `touch`
-- `sed`, `awk`, `cut`, `tr`, `paste`
-- `tar`, `gzip`, `gunzip`, `zip`, `unzip`
-- `git` (for Documents/Groups)
-- `curl`, `wget` (if network_mode allows)
+All of READONLY plus:
+Additional reading: `df`, `locate`, `which`, `whereis`
+Split: `split`, `csplit`
+Additional comparison: `sdiff`, `patch`, `colordiff`
+Archives: `zip`, `7za`
+Compression: `gzip`, `gunzip`, `bzip2`, `bunzip2`, `xz`, `unxz`, `lz4`, `zstd`
+Checksums: `sum`
+Encoding: `uuencode`, `uudecode`
+File modification: `touch`, `mkdir`, `rm`, `rmdir`, `mv`, `cp`, `truncate`, `mktemp`, `install`, `shred`, `rename`
+Permissions: `chmod`
+Document conversion: `pandoc`, `dos2unix`, `unix2dos`, `recode`
+Misc: `seq`, `date`, `cal`, `readlink`, `pathchk`, `pwd`, `uname`, `nproc`, `sleep`, `yes`, `tee`, `gettext`, `tsort`, `true`, `false`
+Media: `ffmpeg`, `magick`, `convert`
+Versioning: `git`
+Network (if enabled): `curl`, `wget`
 
 ### Forbidden patterns
 
@@ -425,20 +444,62 @@ Response format:
 }
 ```
 
-Common error codes:
+### Error Codes Reference
 
-- `FILE_NOT_FOUND` — Path does not exist
-- `FILE_EXISTS` — Destination already exists
-- `FILE_TOO_LARGE` — File exceeds max_file_size_mb limit
-- `PATH_ESCAPE` — Path traversal attempt blocked
-- `PERMISSION_DENIED` — Group ownership check failed
-- `COMMAND_FORBIDDEN` — Command not in whitelist
-- `QUOTA_EXCEEDED` — Storage quota exceeded
-- `FILE_LOCKED` — File locked by another user/conversation
-- `INVALID_ZONE` — Unknown zone parameter
-- `ZONE_READONLY` — Write operation on read-only zone (Uploads)
-- `MISSING_PARAMETER` — Required parameter missing
-- `GROUP_ACCESS_DENIED` — User is not a member of the group
+| Code | Description |
+| --- | --- |
+| `FILE_NOT_FOUND` | Path does not exist |
+| `FILE_EXISTS` | Destination already exists |
+| `FILE_TOO_LARGE` | File exceeds max_file_size_mb limit |
+| `FILE_LOCKED` | File locked by another user/conversation |
+| `PATH_ESCAPE` | Path traversal or symlink escape attempt blocked |
+| `INVALID_PATH` | Path is invalid for operation (e.g., zone root) |
+| `PROTECTED_PATH` | Path is protected and cannot be modified (e.g., .git) |
+| `PATH_STARTS_WITH_ZONE` | Path incorrectly starts with zone name (see howto="paths") |
+| `PERMISSION_DENIED` | Group ownership check failed |
+| `ACCESS_DENIED` | Access denied (e.g., not your download link) |
+| `COMMAND_FORBIDDEN` | Command not in whitelist or network disabled |
+| `ARGUMENT_FORBIDDEN` | Dangerous argument pattern or URL when network disabled |
+| `ARGUMENT_REQUIRED` | Required argument missing (e.g., curl/wget need -o/-O) |
+| `QUOTA_EXCEEDED` | Storage quota exceeded |
+| `INVALID_ZONE` | Unknown zone parameter |
+| `ZONE_FORBIDDEN` | Invalid zone for this operation |
+| `ZONE_READONLY` | Write operation on read-only zone (Uploads) |
+| `MISSING_PARAMETER` | Required parameter missing (including group for zone="group") |
+| `INVALID_PARAMETER` | Invalid parameter value |
+| `GROUP_ACCESS_DENIED` | User is not a member of the group |
+| `NOT_A_FILE` | Expected file but found directory |
+| `NOT_IN_EDIT_MODE` | File not open for locked editing |
+| `NOT_A_FILESHED_LINK` | File was not created by Fileshed |
+| `PATTERN_NOT_FOUND` | Regex pattern not found in file |
+| `EXEC_ERROR` | Command execution failed |
+| `TIMEOUT` | Command exceeded timeout |
+| `INVALID_FORMAT` | Invalid file format for operation |
+| `INVALID_OWNER` | Invalid owner ID for chown |
+| `CSV_PARSE_ERROR` | Failed to parse CSV file |
+| `TABLE_EXISTS` | SQLite table already exists (use if_exists) |
+| `ZIP_BOMB` | ZIP file may be a decompression bomb |
+| `NO_USER_ID` | User ID not available (internal error) |
+| `INVALID_USER` | User ID is missing, empty, or invalid format |
+| `INVALID_GROUP_ID` | Group ID contains forbidden characters |
+| `INVALID_MODE` | Invalid write mode (not owner/group/owner_ro) |
+| `DB_ERROR` | Database operation failed |
+| `GROUP_NOT_FOUND` | Group not found by name |
+| `GROUP_NOT_AVAILABLE` | Group features unavailable (API not found) |
+| `INTERNAL_API_ERROR` | Internal API error |
+| `NOT_FILE_OWNER` | User is not the file owner |
+| `NOT_LOCK_OWNER` | User does not own the lock |
+| `MISSING_FILE_ID` | File ID required but not provided |
+| `LOCK_ERROR` | Failed to acquire lock |
+| `CSV_EMPTY` | CSV file has no data rows |
+| `CSV_TOO_WIDE` | CSV has too many columns (max 5000) |
+| `COMMAND_NOT_FOUND` | Command not found on system |
+| `GIT_NOT_AVAILABLE` | Git is not available on system |
+| `EXECUTION_ERROR` | Command execution error |
+| `OPENWEBUI_API_UNAVAILABLE` | Open WebUI internal API unavailable |
+| `OPENWEBUI_INSERT_ERROR` | Failed to create download link |
+| `OPENWEBUI_GET_ERROR` | Failed to retrieve file metadata |
+| `OPENWEBUI_DELETE_ERROR` | Failed to delete download link |
 
 ## Response Format
 
@@ -462,6 +523,96 @@ All functions return JSON with consistent structure:
   "error": { ... }
 }
 ```
+
+## Design Rationale
+
+This section documents deliberate design decisions and their justifications. It helps auditors understand intentional trade-offs and avoid false positives.
+
+### General Principles
+
+- **No logging.** Errors are raised to the calling LLM, not logged to files. This keeps the system simple and avoids log management complexity.
+- **No system data in errors.** Error messages never expose internal identifiers, UUIDs, or absolute disk paths. Only user-facing information is returned.
+- **LLM-oriented documentation.** All functions include detailed docstrings and contextual error hints to help even small LLMs understand correct usage patterns.
+
+### LLM Guardrails
+
+Each tool call is expensive (API latency, token consumption, context pollution). The goal is to **minimize round-trips** between the LLM and the tool by making errors self-correcting.
+
+**When documentation fails, error messages must succeed.**
+
+An error response must include:
+1. **The faulty parameter name** — so the LLM knows what to fix
+2. **The received value** (with type if ambiguous) — so the LLM sees what it passed
+3. **The expected format** — so the LLM knows how to correct it
+4. **A concrete example** in the hint — so even a small LLM (8B) can copy-paste
+
+Example of a **bad** error (causes retry loops):
+```json
+{"error": "EXEC_ERROR", "message": "Execution error", "hint": null}
+```
+
+Example of a **good** error (self-correcting):
+```json
+{
+  "error": "INVALID_PARAMETER",
+  "message": "max_output must be an integer or None, got: '' (empty string)",
+  "hint": "Omit max_output or use an integer like max_output=50000"
+}
+```
+
+**Type coercion rules:**
+- Falsy values for optional list parameters (`args=0`, `args=""`) are silently converted to `[]`
+- Falsy values for optional string parameters (`message=""`) use the default value
+- Invalid types for numeric parameters (`line=""`, `offset=""`) raise `INVALID_PARAMETER` with the parameter name
+- `overwrite=True` silently ignores positioning parameters (`line`, `end_line`, `pattern`) to avoid spurious errors
+
+### Performance and Quotas
+
+- **No quota caching.** Every write operation recalculates disk usage in real-time (O(n) files). This is intentional: simplicity and reliability over performance. A cache would introduce invalidation problems, undetected quota overruns, and subtle bugs. The usage context (LLM tool, not high-performance filesystem) doesn't justify the complexity.
+
+### SQLite Security
+
+- **ATTACH DATABASE, DETACH, and LOAD_EXTENSION are blocked.** These commands could access files outside the intended scope or load malicious code. Blocking is implemented via pattern detection in SQL queries.
+- **SQL comment stripping.** Before checking for dangerous patterns, SQL comments are removed (both `/* */` blocks and `-- ...` lines). This prevents bypass attacks like `AT/**/TACH` or `LOAD_EX--bypass\nTENSION`.
+- **No SQL query whitelist.** The `sqlite_readonly` valve restricts to SELECT-only when needed. In read-write mode, the LLM needs to create tables, insert data, etc. Only specific dangerous operations (ATTACH, LOAD_EXTENSION) are blocked individually.
+
+### ZIP Archive Security
+
+- **Magic bytes verification.** Beyond the `.zip` extension, Fileshed verifies file headers match ZIP format (PK signatures). This prevents attacks via renamed files.
+- **First-level extraction only.** `shed_unzip` extracts only the ZIP passed as parameter. Nested `.zip` files are extracted as regular files (not automatically decompressed). If the user wants to extract them, they must call `shed_unzip` again — and all protections (max size, file count, compression ratio) apply again. This is not a "nested ZIP bomb" vulnerability.
+- **Symlink check before extraction.** Just before `extractall()`, Fileshed verifies the destination directory is not a symlink (TOCTOU protection).
+
+### CSV Protection
+
+- **Column limit (5000 max).** CSV files with extreme column counts could cause DoS via memory consumption. The 5000 column limit is large enough for legitimate edge cases while protecting against abuse.
+
+### Specific Error Codes
+
+- **FILE_OWNER_ONLY and FILE_READ_ONLY** are internal permission check return values, not error codes raised to users. They allow the code to distinguish permission failure reasons internally, then raise appropriate `PERMISSION_DENIED` errors with descriptive messages.
+- **INVALID_PATH and PROTECTED_PATH** distinguish invalid paths (e.g., zone root) from protected paths (e.g., `.git` directory).
+
+### Architecture and LLM Exposure
+
+- **Only `shed_*` methods are exposed to the LLM.** The `_FileshedCore` class contains all internal logic and is never directly callable. This separation relies on OpenWebUI's architecture which only exposes `Tools` class methods.
+- **Monolithic file.** All code is in a single file because OpenWebUI Tools are deployed as single Python files. Splitting into multiple modules would create deployment risks: version mismatches between files, incomplete updates, import path issues. The single-file approach ensures atomic deployment — the tool either works completely or fails cleanly.
+
+### Shell Commands
+
+- **Strict whitelist.** Allowed commands are explicitly listed. Dangerous commands (shells, interpreters, upload-capable network tools) are blacklisted.
+- **printenv and envsubst removed.** These commands exposed environment variables, potentially containing secrets.
+- **Pattern-based validation.** Dangerous arguments (shell metacharacters, injections) are detected via regex. This is defense-in-depth, not absolute protection. The command whitelist remains the primary protection.
+
+### Locking and Concurrency
+
+- **File-based locks.** Locks use `os.open()` with `O_CREAT | O_EXCL` for atomic acquisition. This mechanism works for a single OpenWebUI instance.
+- **No distributed locks.** File locks are unreliable across multiple instances/containers sharing NFS storage. For multi-instance deployments, an external locking mechanism (Redis, database) would be needed. This use case is not supported in the current version.
+
+### OpenWebUI Dependencies
+
+- **Internal APIs.** Fileshed uses OpenWebUI internal APIs (`open_webui.models.*`). These APIs may change between versions. Current target version is OpenWebUI 0.4.0+.
+- **Bridge pattern.** `_OpenWebUIBridge` isolates version-specific imports to facilitate adaptation to future versions.
+
+---
 
 ## Authors
 

@@ -6,9 +6,11 @@
 
 **Store, organize, collaborate, and share files across conversations.**
 
-[![Version](https://img.shields.io/badge/version-1.0.2-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-1.0.3-blue.svg)]()
 [![Open WebUI](https://img.shields.io/badge/Open%20WebUI-Tool-green.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)]()
+[![Tests](https://img.shields.io/badge/tests-1101%20passed-brightgreen.svg)](docs/audits/fileshed/reports/Exec_tests.md)
+[![Audited](https://img.shields.io/badge/audited-★★★★☆-blue.svg)](#testing--audits)
 
 ---
 
@@ -99,6 +101,28 @@ Fileshed gives your LLM a persistent workspace. It provides:
 
 ---
 
+## Installation
+
+1. In Open WebUI, go to **Workspace > Tools**
+2. Click **"+"** or **"Create Tool"** and paste the content of `Fileshed.py`
+3. Save the tool
+4. In a new chat, click the **"+"** button next to the message input and enable **Fileshed**
+
+> ℹ️ **Note:** Tools are in **Workspace > Tools**, not Admin Panel. Functions (Admin Panel) are different — they extend the platform itself.
+
+---
+
+## Model Configuration (Required)
+
+For Fileshed to work properly, your model must have **Native Function Calling** enabled:
+
+- **User level:** Workspace > Models > [Select Model] > Advanced Parameters > Function Calling > "Native"
+- **Admin level:** Admin Panel > Settings > Models > [Select Model] > Advanced Parameters > Function Calling > "Native"
+
+Without this setting, the LLM won't be able to call Fileshed functions correctly.
+
+---
+
 ## How It Works
 
 Fileshed provides four storage zones:
@@ -152,8 +176,8 @@ shed_exec(zone="storage", cmd="jq",
 ### Create and Edit Files
 
 ```python
-# Create a new file (overwrite=True to replace entire content)
-shed_patch_text(zone="storage", path="notes.txt", content="Hello world!", overwrite=True)
+# Create a new file (simplest way!)
+shed_create_file(zone="storage", path="notes.txt", content="Hello world!")
 
 # Append to a file
 shed_patch_text(zone="storage", path="log.txt", content="New entry\n", position="end")
@@ -176,8 +200,7 @@ shed_exec(zone="documents", cmd="git", args=["log", "--oneline", "-10"])
 shed_exec(zone="documents", cmd="git", args=["diff", "HEAD~1"])
 
 # Create a file with commit message
-shed_patch_text(zone="documents", path="report.md", content="# Report\n...", 
-                overwrite=True, message="Initial draft")
+shed_create_file(zone="documents", path="report.md", content="# Report\n...", message="Initial draft")
 ```
 
 ### Group Collaboration
@@ -190,8 +213,8 @@ shed_group_list()
 shed_exec(zone="group", group="team-alpha", cmd="ls", args=["-la"])
 
 # Create a shared file
-shed_patch_text(zone="group", group="team-alpha", path="shared.md", 
-                content="# Shared Notes\n", overwrite=True, message="Init")
+shed_create_file(zone="group", group="team-alpha", path="shared.md",
+                 content="# Shared Notes\n", message="Init")
 
 # Copy a file to a group
 shed_copy_to_group(src_zone="storage", src_path="report.pdf", 
@@ -244,6 +267,9 @@ shed_zip(zone="storage", src="projects", dest="backup.zip", include_empty_dirs=T
 
 # Extract a ZIP
 shed_unzip(zone="storage", src="archive.zip", dest="extracted/")
+
+# Extract a ZIP from Uploads to Storage (cross-zone)
+shed_unzip(zone="storage", src="data.zip", dest="imported/", src_zone="uploads")
 
 # List ZIP contents without extracting
 shed_zipinfo(zone="storage", path="archive.zip")
@@ -326,11 +352,12 @@ shed_patch_text(zone="storage", path="projects/2024/.keep", content="")
 |----------|-------------|
 | `shed_exec(zone, cmd, args=[], stdout_file=None, stderr_file=None, group=None)` | Execute shell commands (use cat/head/tail to READ files, stdout_file= to redirect output) |
 
-### File Writing (2 functions)
+### File Writing (3 functions)
 
 | Function | Description |
 |----------|-------------|
-| `shed_patch_text(zone, path, content, ...)` | THE standard function to write/create text files |
+| `shed_create_file(zone, path, content, ...)` | Create or overwrite a file (simplest way!) |
+| `shed_patch_text(zone, path, content, ...)` | Append, insert, or replace text in files |
 | `shed_patch_bytes(zone, path, content, ...)` | Write binary data to files |
 
 ### File Operations (3 functions)
@@ -355,18 +382,18 @@ shed_patch_text(zone="storage", path="projects/2024/.keep", content="")
 
 | Function | Description |
 |----------|-------------|
-| `shed_move_uploads_to_storage(src, dest)` | Move from Uploads to Storage |
-| `shed_move_uploads_to_documents(src, dest, message=None)` | Move from Uploads to Documents |
-| `shed_copy_storage_to_documents(src, dest, message=None)` | Copy from Storage to Documents |
-| `shed_move_documents_to_storage(src, dest, message=None)` | Move from Documents to Storage |
-| `shed_copy_to_group(src_zone, src_path, group, dest_path, message=None, mode=None)` | Copy to a group |
+| `shed_move_uploads_to_storage(src, dest, overwrite=False)` | Move from Uploads to Storage |
+| `shed_move_uploads_to_documents(src, dest, message=None, overwrite=False)` | Move from Uploads to Documents |
+| `shed_copy_storage_to_documents(src, dest, message=None, overwrite=False)` | Copy from Storage to Documents |
+| `shed_move_documents_to_storage(src, dest, message=None, overwrite=False)` | Move from Documents to Storage |
+| `shed_copy_to_group(src_zone, src_path, group, dest_path, message=None, mode=None, overwrite=False)` | Copy to a group |
 
 ### Archives (3 functions)
 
 | Function | Description |
 |----------|-------------|
 | `shed_zip(zone, src, dest='', include_empty_dirs=False)` | Create ZIP archive |
-| `shed_unzip(zone, src, dest='')` | Extract ZIP archive |
+| `shed_unzip(zone, src, dest='', src_zone='')` | Extract ZIP archive (src_zone allows extracting from another zone) |
 | `shed_zipinfo(zone, path)` | List ZIP contents |
 
 ### Data & Analysis (2 functions)
@@ -412,16 +439,7 @@ shed_patch_text(zone="storage", path="projects/2024/.keep", content="")
 | `shed_allowed_commands()` | List allowed shell commands |
 | `shed_maintenance()` | Cleanup expired locks |
 
-**Total: 37 functions**
-
----
-
-## Installation
-
-1. Copy `Fileshed.py` to your Open WebUI tools directory
-2. Enable the tool in Admin Panel → Tools
-3. **Important:** Enable Native Function Calling:
-   - Admin Panel → Settings → Models → [Select Model] → Advanced Parameters → Function Calling → "Native"
+**Total: 38 functions**
 
 ---
 
@@ -457,6 +475,27 @@ shed_patch_text(zone="storage", path="projects/2024/.keep", content="")
 
 ---
 
+## Testing & Audits
+
+Fileshed has been independently audited by multiple AI models and validated with comprehensive functional tests.
+
+| Auditor | Rating | Report |
+|---------|:------:|--------|
+| ChatGPT 5.2 Instant | ★★★★★ (5/5) | [Full report](docs/audits/fileshed/reports/openai_chatgpt_5.2_instant.md) |
+| Claude Opus 4.5 (Thinking) | ★★★★☆ (4/5) | [Full report](docs/audits/fileshed/reports/anthopic_claude_opus_4.5_thinking.md) |
+
+**Key strengths identified:**
+- Strong filesystem isolation with symlink detection
+- Defense-in-depth command validation (whitelist + pattern blocking)
+- Comprehensive network exfiltration controls
+- Clean separation between LLM-facing API and internal logic
+
+All issues identified during audits have been addressed.
+
+**Test coverage:** [1101 functional tests](docs/audits/fileshed/reports/Exec_tests.md) — All passing
+
+---
+
 ## Optional Dependencies
 
 Some features require additional tools installed in the Open WebUI container:
@@ -473,7 +512,7 @@ Some features require additional tools installed in the Open WebUI container:
 **Without these tools, you can still:**
 - Convert between markdown, docx, html, LaTeX source (via pandoc)
 - Process media with ffmpeg
-- Use all 37 Fileshed functions
+- Use all 38 Fileshed functions
 
 ---
 

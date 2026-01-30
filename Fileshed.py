@@ -1,8 +1,8 @@
 """
 title: Fileshed
-description: Persistent file storage with group collaboration. FIRST: Run shed_help() for quick reference or shed_help(howto="...") for guides: download, csv_to_sqlite, upload, share, edit, commands, network, paths, full. Config: shed_parameters().
+description: Persistent file storage with group collaboration. FIRST: Run shed_help() for quick reference or shed_help(howto="...") for guides: download, csv_to_sqlite, upload, share, edit, commands, network, paths, large_files, full. Config: shed_parameters().
 author: Fade78 (with Claude Opus 4.5)
-version: 1.0.2
+version: 1.0.3
 license: MIT
 required_open_webui_version: 0.4.0
 
@@ -75,7 +75,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 # Try to import Open WebUI Groups API
@@ -85,6 +85,34 @@ try:
     GROUPS_AVAILABLE = True
 except ImportError:
     pass
+
+
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+
+# Size conversion
+BYTES_PER_KB = 1024
+BYTES_PER_MB = 1024 * 1024
+
+# ZIP bomb protection limits
+ZIP_MAX_DECOMPRESSED_SIZE = 500 * BYTES_PER_MB  # 500 MB max decompressed
+ZIP_MAX_FILES = 10000                            # Max files in archive
+ZIP_MAX_COMPRESSION_RATIO = 100                  # Max compression ratio (100:1)
+ZIP_MAGIC_BYTES = (b'PK\x03\x04', b'PK\x05\x06', b'PK\x07\x08')  # Valid ZIP signatures
+
+# CSV protection limits
+CSV_MAX_COLUMNS = 5000  # Prevent DoS with extremely wide CSV files
+
+# Output limits
+MAX_HEXDUMP_BYTES = 4096
+DEFAULT_HEXDUMP_BYTES = 256
+
+# Validation patterns
+UUID_PATTERN = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+
+# SQL protection limits
+MAX_SQL_ROWS = 10000  # Hard limit even when user requests unlimited (limit=0)
 
 
 # =============================================================================
@@ -191,12 +219,12 @@ WHITELIST_READWRITE = WHITELIST_READONLY | {
     "date", "cal",
     # Additional paths
     "readlink", "pathchk", "pwd",
-    # System (info only - env removed, can execute commands)
-    "uname", "nproc", "printenv",
+    # System (info only - env/printenv removed, can expose secrets)
+    "uname", "nproc",
     # Control (timeout removed - can execute commands, we have internal timeout)
     "sleep",
-    # Misc (xargs removed - can execute arbitrary commands)
-    "yes", "tee", "envsubst", "gettext", "tsort", "true", "false",
+    # Misc (xargs removed - can execute arbitrary commands, envsubst removed - exposes env vars)
+    "yes", "tee", "gettext", "tsort", "true", "false",
     # Media
     "ffmpeg", "magick", "convert",
     # Versioning
@@ -289,15 +317,24 @@ BLACKLIST_COMMANDS = {
 }
 
 # Pattern to detect dangerous arguments (shell metacharacters)
-# Blocks: ; & | ` $ \n \r && || >> << > < $( ${
-DANGEROUS_ARGS_PATTERN = re.compile(r'[;&|`$\n\r]|&&|\|\||>>|<<|>|<|\$\(|\$\{')
+# Blocks: ; & | ` \n \r && || >> << > $( ${
+# Note: $ alone is NOT blocked because subprocess.run() with list args doesn't expand variables
+# Only $( and ${ are dangerous (command substitution / brace expansion)
+# Note: < is allowed for comparisons (reading via getline < is blocked separately)
+# Note: > is blocked to prevent file writes outside chroot (use stdout_file parameter instead)
+DANGEROUS_ARGS_PATTERN = re.compile(r'[;&|`\n\r]|&&|\|\||>>|<<|>|\$\(|\$\{')
 
 # Same pattern but allows | (for commands that use | in their internal syntax)
-# Used for: jq (pipe operator), awk (print | "cmd" - but we block system() separately)
-DANGEROUS_ARGS_PATTERN_ALLOW_PIPE = re.compile(r'[;&`$\n\r]|&&|>>|<<|>|<|\$\(|\$\{')
+# Used for: jq (pipe operator), awk (print | "cmd" - but we block system() separately),
+# grep -E (extended regex alternation)
+DANGEROUS_ARGS_PATTERN_ALLOW_PIPE = re.compile(r'[;&`\n\r]|&&|>>|<<|>|\$\(|\$\{')
 
 # Commands that use | in their internal syntax (not shell pipes)
-COMMANDS_ALLOWING_PIPE = {"jq", "awk", "gawk", "mawk", "nawk"}
+# - jq: pipe operator for chaining filters
+# - awk: print | "cmd" (but we block system() separately via AWK_DANGEROUS_PATTERNS)
+# - grep/egrep/fgrep: extended regex alternation with -E or -P flags
+# Safe because subprocess.run() with list args never invokes shell interpretation
+COMMANDS_ALLOWING_PIPE = {"jq", "awk", "gawk", "mawk", "nawk", "grep", "egrep", "fgrep"}
 
 # Pattern to detect URLs (network access via ffmpeg, pandoc, imagemagick, etc.)
 # Blocks: http://, https://, ftp://, rtmp://, rtsp://, smb://, file://, etc.
@@ -306,9 +343,10 @@ URL_PATTERN = re.compile(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', re.IGNORECASE)
 # find options that can execute commands (security risk)
 FIND_EXEC_OPTIONS = {"-exec", "-execdir", "-ok", "-okdir"}
 
-# awk patterns that can execute commands (security risk)
-# system() executes shell commands, getline can pipe from commands
-AWK_DANGEROUS_PATTERNS = re.compile(r'\bsystem\s*\(|\|\s*getline|\bgetline\s*<')
+# awk patterns that can execute commands or leak sensitive data (security risk)
+# system() executes shell commands, getline can pipe from commands,
+# ENVIRON exposes environment variables (may contain secrets)
+AWK_DANGEROUS_PATTERNS = re.compile(r'\bsystem\s*\(|\|\s*getline|\bgetline\s*<|\bENVIRON\b')
 
 # ffmpeg options that can be used for data exfiltration or other dangerous operations
 # in "safe" network mode. These are blocked unless network_mode="all"
@@ -385,7 +423,7 @@ class _OpenWebUIBridge:
             cls._instance = super().__new__(cls)
         return cls._instance
     
-    def _ensure_initialized(self):
+    def _ensure_initialized(self) -> bool:
         """Lazy initialization of Open WebUI imports."""
         if self._initialized:
             return True
@@ -397,7 +435,7 @@ class _OpenWebUIBridge:
             self._file_form_class = FileForm
             self._initialized = True
             return True
-        except ImportError as e:
+        except ImportError:
             # Try alternative import paths for different versions
             try:
                 # Hypothetical future API path
@@ -410,8 +448,8 @@ class _OpenWebUIBridge:
                 pass
             raise StorageError(
                 "OPENWEBUI_API_UNAVAILABLE",
-                f"Cannot import Open WebUI internal API: {e}",
-                {"import_error": str(e)},
+                "Cannot import Open WebUI internal API",
+                None,
                 "Open WebUI internal modules not available. This feature requires running inside Open WebUI."
             )
     
@@ -424,7 +462,7 @@ class _OpenWebUIBridge:
         content_type: str,
         file_size: int,
         metadata: dict = None
-    ):
+    ) -> Any:
         """
         Insert a new file into Open WebUI's file system.
         
@@ -461,35 +499,35 @@ class _OpenWebUIBridge:
                 ),
             )
             return file_item
-        except Exception as e:
+        except Exception:
             raise StorageError(
                 "OPENWEBUI_INSERT_ERROR",
-                f"Failed to insert file into Open WebUI: {e}",
-                {"file_id": file_id, "error": str(e)}
+                "Failed to insert file into Open WebUI",
+                {"file_id": file_id}
             )
     
-    def get_file_by_id(self, file_id: str):
+    def get_file_by_id(self, file_id: str) -> Any:
         """Get file metadata by ID."""
         self._ensure_initialized()
         try:
             return self._files_class.get_file_by_id(file_id)
-        except Exception as e:
+        except Exception:
             raise StorageError(
                 "OPENWEBUI_GET_ERROR",
-                f"Failed to get file from Open WebUI: {e}",
-                {"file_id": file_id, "error": str(e)}
+                "Failed to get file from Open WebUI",
+                {"file_id": file_id}
             )
-    
-    def delete_file_by_id(self, file_id: str):
+
+    def delete_file_by_id(self, file_id: str) -> Any:
         """Delete a file by ID."""
         self._ensure_initialized()
         try:
             return self._files_class.delete_file_by_id(file_id)
-        except Exception as e:
+        except Exception:
             raise StorageError(
                 "OPENWEBUI_DELETE_ERROR",
-                f"Failed to delete file from Open WebUI: {e}",
-                {"file_id": file_id, "error": str(e)}
+                "Failed to delete file from Open WebUI",
+                {"file_id": file_id}
             )
     
     @classmethod
@@ -499,16 +537,16 @@ class _OpenWebUIBridge:
             instance = cls()
             instance._ensure_initialized()
             return True
-        except:
+        except Exception:
             return False
-    
+
     @classmethod
     def get_api_version(cls) -> str:
         """Return the detected Open WebUI API version."""
         try:
             from open_webui import __version__
             return __version__
-        except:
+        except ImportError:
             return "unknown"
 
 
@@ -539,6 +577,19 @@ class _FileshedCore:
     
     FUNCTION_HELP = {
         # === DIRECT WRITE FUNCTIONS ===
+        "shed_create_file": {
+            "usage": "shed_create_file(zone, path, content, file_type='text', content_format='hex')",
+            "desc": "Create or overwrite a file. Simplest way to write a file!",
+            "workflows": ["Direct Write"],
+            "howtos": ["edit"],
+            "not_for": ["Appending to file (use shed_patch_text)", "Patching specific lines (use shed_patch_text)"],
+            "tips": [
+                "Creates parent directories automatically",
+                "file_type='text' (default) or 'bytes'",
+                "For bytes: content_format='hex' (default), 'base64', or 'raw'",
+                "For appending: use shed_patch_text(zone, path, content) instead",
+            ],
+        },
         "shed_patch_text": {
             "usage": "shed_patch_text(zone, path, content, position='end', overwrite=False, ...)",
             "desc": "THE standard function to write/create text files. Use this for all file writing!",
@@ -546,7 +597,7 @@ class _FileshedCore:
             "howtos": ["edit"],
             "not_for": ["Locked Edit workflow (shed_lockedit_*)"],
             "tips": [
-                "Create new file: shed_patch_text(zone, path, content, overwrite=True)",
+                "💡 To CREATE a file: use shed_create_file(zone, path, content) instead!",
                 "Append to file: shed_patch_text(zone, path, content)  # position='end' by default",
                 "To READ files: use shed_exec(cmd='cat', args=['file']) or head/tail/sed",
                 "⚠️ CSV: quote fields with comma/newline/quotes. Escape quotes by doubling: \"\"",
@@ -688,36 +739,45 @@ class _FileshedCore:
             ],
         },
         "shed_move_uploads_to_storage": {
-            "usage": "shed_move_uploads_to_storage(src, dest)",
+            "usage": "shed_move_uploads_to_storage(src, dest, overwrite=False)",
             "desc": "Move file from Uploads to Storage",
             "workflows": ["Upload Handling", "File Operations"],
             "howtos": ["upload"],
             "not_for": ["Locked Edit workflow"],
-            "tips": ["Uploads zone is read-only, move files to Storage for editing"],
+            "tips": [
+                "Uploads zone is read-only, move files to Storage for editing",
+                "overwrite=True to replace existing destination file",
+            ],
         },
         "shed_move_uploads_to_documents": {
-            "usage": "shed_move_uploads_to_documents(src, dest, message=None)",
+            "usage": "shed_move_uploads_to_documents(src, dest, message=None, overwrite=False)",
             "desc": "Move file from Uploads to Documents (versioned)",
             "workflows": ["Upload Handling", "File Operations"],
             "howtos": ["upload"],
             "not_for": ["Locked Edit workflow"],
-            "tips": ["Documents zone has Git versioning"],
+            "tips": [
+                "Documents zone has Git versioning",
+                "overwrite=True to replace existing destination file",
+            ],
         },
         "shed_copy_storage_to_documents": {
-            "usage": "shed_copy_storage_to_documents(src, dest, message=None)",
+            "usage": "shed_copy_storage_to_documents(src, dest, message=None, overwrite=False)",
             "desc": "Copy file from Storage to Documents (versioned)",
             "workflows": ["File Operations"],
             "howtos": ["upload"],
             "not_for": ["Locked Edit workflow"],
-            "tips": [],
+            "tips": ["overwrite=True to replace existing destination file"],
         },
         "shed_move_documents_to_storage": {
-            "usage": "shed_move_documents_to_storage(src, dest, message=None)",
+            "usage": "shed_move_documents_to_storage(src, dest, message=None, overwrite=False)",
             "desc": "Move file from Documents to Storage (removes versioning)",
             "workflows": ["File Operations"],
             "howtos": ["upload"],
             "not_for": ["Locked Edit workflow"],
-            "tips": ["message: Git commit message for the removal from Documents"],
+            "tips": [
+                "message: Git commit message for the removal from Documents",
+                "overwrite=True to replace existing destination file",
+            ],
         },
         
         # === LINKS ===
@@ -768,12 +828,12 @@ class _FileshedCore:
             "tips": [],
         },
         "shed_copy_to_group": {
-            "usage": "shed_copy_to_group(src_zone, src_path, group, dest_path, message=None)",
+            "usage": "shed_copy_to_group(src_zone, src_path, group, dest_path, message=None, overwrite=False)",
             "desc": "Copy file to a group",
             "workflows": ["Collaboration", "File Operations"],
             "howtos": [],
             "not_for": ["Locked Edit workflow", "Direct Write workflow"],
-            "tips": [],
+            "tips": ["overwrite=True to replace existing destination file"],
         },
         
         # === ZIP ===
@@ -1310,8 +1370,8 @@ shed_link_delete(file_id="abc123-...")
 For quick edits when you don't need locking:
 
 ```
-# Overwrite entire file
-shed_patch_text(zone="storage", path="file.txt", content="New content", overwrite=True)
+# Create or overwrite a file (simplest way!)
+shed_create_file(zone="storage", path="file.txt", content="New content")
 
 # Append to file
 shed_patch_text(zone="storage", path="file.txt", content="\\nNew line", position="end")
@@ -1320,11 +1380,7 @@ shed_patch_text(zone="storage", path="file.txt", content="\\nNew line", position
 shed_patch_text(zone="storage", path="config.py", content="DEBUG=False", pattern="DEBUG=True", position="replace")
 ```
 
-⚠️ `overwrite` is a PARAMETER (True/False), NOT a position value!
-```
-✅ CORRECT: shed_patch_text(..., overwrite=True)
-❌ WRONG:   shed_patch_text(..., position="overwrite")
-```
+💡 **Use `shed_create_file()` for creating files** - it's simpler than `shed_patch_text(..., overwrite=True)`
 
 ### WORKFLOW 2: Locked Edit (with locking)
 For concurrent access or when you need rollback:
@@ -1361,7 +1417,7 @@ shed_lockedit_save(...)
 
 | Task | Command |
 |------|---------|
-| Overwrite file | `shed_patch_text(..., overwrite=True)` |
+| Create/overwrite file | `shed_create_file(zone, path, content)` |
 | Append to file | `shed_patch_text(..., position="end")` |
 | Prepend to file | `shed_patch_text(..., position="start")` |
 | Insert before line N | `shed_patch_text(..., position="before", line=N)` |
@@ -1407,10 +1463,10 @@ sort, uniq, cut, diff, tar (list), unzip (list), md5sum, sha256sum, jq, etc.
 
 ## Storage zone (READ-WRITE)
 All read-only commands PLUS:
-cp, mv, rm, mkdir, rmdir, touch, chmod, ln, tar (create/extract),
+cp, mv, rm, mkdir, rmdir, touch, chmod, tar (create/extract),
 zip, gzip, gunzip, patch, split, csplit, truncate, etc.
 
-Network commands (if enabled): curl, wget, git, rsync, scp, ssh
+Network commands (if enabled): curl, wget, git
 
 ## Documents zone (READ-WRITE + VERSIONED)
 Same as Storage, with automatic Git commits.
@@ -1525,19 +1581,63 @@ shed_exec(zone="storage", cmd="git", args=["clone", "https://github.com/user/rep
         "paths": """
 # HOWTO: Path rules
 
-## Golden rule
-Paths are RELATIVE to the zone root. Never include the zone name!
+## ⚠️ CRITICAL: Never include the zone name in the path!
 
-## Correct vs Wrong
-```
-CORRECT: shed_exec(zone="storage", cmd="cat", args=["projects/file.txt"])
-WRONG:   shed_exec(zone="storage", cmd="cat", args=["Storage/projects/file.txt"])
+The `zone` parameter already specifies WHERE to operate. The path in `args` is RELATIVE to that zone.
 
-CORRECT: shed_exec(zone="documents", cmd="ls", args=["reports"])
-WRONG:   shed_exec(zone="documents", cmd="ls", args=["Documents/reports"])
+**Fileshed automatically rejects paths that start with the zone name** (error code: PATH_STARTS_WITH_ZONE).
+
+### Example of the mistake
+
+User asks: "In Documents, create a folder MyProject"
+
 ```
+❌ REJECTED (would create Documents/Documents/MyProject):
+shed_exec(zone="Documents", cmd="mkdir", args=["-p", "Documents/MyProject"])
+→ Error: PATH_STARTS_WITH_ZONE
+
+✅ CORRECT (creates Documents/MyProject):
+shed_exec(zone="Documents", cmd="mkdir", args=["-p", "MyProject"])
+```
+
+### Why this happens
+
+The zone parameter already points to the Documents folder:
+- zone="Documents" → You're working INSIDE Documents
+- args=["MyProject"] → Creates MyProject/ inside Documents
+- args=["Documents/MyProject"] → Creates Documents/MyProject/ inside Documents (WRONG!)
+
+### More examples
+
+```
+✅ CORRECT: shed_exec(zone="storage", cmd="cat", args=["projects/file.txt"])
+❌ REJECTED: shed_exec(zone="storage", cmd="cat", args=["Storage/projects/file.txt"])
+
+✅ CORRECT: shed_exec(zone="documents", cmd="ls", args=["reports"])
+❌ REJECTED: shed_exec(zone="documents", cmd="ls", args=["Documents/reports"])
+
+✅ CORRECT: shed_exec(zone="documents", cmd="mkdir", args=["-p", "Projects/2024"])
+❌ REJECTED: shed_exec(zone="documents", cmd="mkdir", args=["-p", "Documents/Projects/2024"])
+```
+
+## Exception: allow_zone_in_path
+
+In rare cases where the user explicitly wants a subfolder named after the zone
+(e.g., a "Storage" folder inside Storage), use the `allow_zone_in_path` parameter:
+
+```
+# User explicitly wants: Storage/Storage/backup/
+shed_exec(zone="storage", cmd="mkdir", args=["-p", "Storage/backup"], allow_zone_in_path=True)
+```
+
+This parameter is available on: `shed_exec`, `shed_patch_text`, `shed_patch_bytes`,
+`shed_delete`, `shed_rename`, all `shed_lockedit_*` functions, `shed_copy_to_group`,
+and all `shed_move_*/shed_copy_*` bridge functions.
+
+**Only use this when the user explicitly confirms they want a subfolder with that name.**
 
 ## Zone roots
+
 Paths are always relative to the zone root:
 - Uploads: per-conversation (auto-managed)
 - Storage: your personal workspace
@@ -1545,16 +1645,19 @@ Paths are always relative to the zone root:
 - Group: shared group space
 
 ## Case sensitivity
+
 - **Zone parameter**: case-insensitive ("Storage" = "storage" = "STORAGE")
 - **Group name**: ⚠️ **CASE-SENSITIVE** ("MyTeam" ≠ "myteam" ≠ "MYTEAM")
 - **File paths**: depends on filesystem (usually case-sensitive on Linux)
 
 ## Creating folders
+
 ```
 shed_exec(zone="storage", cmd="mkdir", args=["-p", "projects/webapp/src"])
 ```
 
 ## Listing contents
+
 ```
 shed_exec(zone="storage", cmd="ls", args=["-la"])           # Root of Storage
 shed_exec(zone="storage", cmd="ls", args=["-la", "projects"]) # Subfolder
@@ -1680,7 +1783,32 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
 
     def _get_user_root(self, __user__: dict) -> Path:
         """Returns the user's root directory."""
-        user_id = __user__.get("id", "anonymous")
+        if __user__ is None:
+            __user__ = {}
+        user_id = __user__.get("id", "")
+
+        # Validate user_id: must be non-empty and valid UUID format
+        if not user_id or not isinstance(user_id, str):
+            raise StorageError(
+                "INVALID_USER",
+                "User ID is missing or invalid",
+                hint="Authentication required"
+            )
+        user_id = user_id.strip()
+        if not user_id:
+            raise StorageError(
+                "INVALID_USER",
+                "User ID is empty",
+                hint="Authentication required"
+            )
+        # UUID format validation (8-4-4-4-12 hex pattern)
+        if not UUID_PATTERN.match(user_id):
+            raise StorageError(
+                "INVALID_USER",
+                "User ID format is invalid",
+                hint="Valid UUID required"
+            )
+
         return Path(self.valves.storage_base_path) / "users" / user_id
 
     def _get_groups_root(self) -> Path:
@@ -1691,9 +1819,60 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
         """Returns the SQLite database path."""
         return Path(self.valves.storage_base_path) / "access_auth.sqlite"
 
+    def _strip_sql_comments(self, sql: str) -> str:
+        """
+        Strips SQL comments from a query string.
+
+        Removes both block comments (/* ... */) and line comments (-- ...).
+        This prevents bypass attacks like AT/**/TACH or LOAD_EX--comment
+        TENSION.
+
+        :param sql: SQL query string
+        :return: Query with comments removed
+        """
+        import re
+        # Remove block comments (non-greedy to handle multiple comments)
+        result = re.sub(r'/\*.*?\*/', '', sql, flags=re.DOTALL)
+        # Remove line comments (-- until end of line)
+        result = re.sub(r'--[^\n]*', '', result)
+        return result
+
+    def _format_size(self, size_bytes: int, short: bool = False) -> str:
+        """
+        Formats a byte size as a human-readable string.
+
+        :param size_bytes: Size in bytes
+        :param short: If True, use short format (1.5M), else full (1.50 MB)
+        :return: Formatted string
+        """
+        if short:
+            if size_bytes > 1024 * 1024:
+                return f"{size_bytes / 1024 / 1024:.1f}M"
+            elif size_bytes > 1024:
+                return f"{size_bytes / 1024:.1f}K"
+            else:
+                return f"{size_bytes}B"
+        else:
+            if size_bytes > 1024 * 1024:
+                return f"{size_bytes / 1024 / 1024:.2f} MB"
+            elif size_bytes > 1024:
+                return f"{size_bytes / 1024:.1f} KB"
+            else:
+                return f"{size_bytes} B"
+
     def _get_conv_id(self, __metadata__: dict) -> str:
-        """Returns the conversation ID."""
-        return __metadata__.get("chat_id", "unknown")
+        """Returns the conversation ID, validated for safe path usage."""
+        if __metadata__ is None:
+            __metadata__ = {}
+        conv_id = __metadata__.get("chat_id", "unknown")
+        # Validate conv_id: must not contain path traversal or control characters
+        if conv_id and isinstance(conv_id, str):
+            conv_id = conv_id.strip()
+            if ".." in conv_id or "/" in conv_id or "\\" in conv_id:
+                return "unknown"  # Invalid conv_id, use safe default
+            if any(ord(c) < 32 for c in conv_id):
+                return "unknown"  # Contains control characters
+        return conv_id if conv_id else "unknown"
 
     def _resolve_zone(
         self,
@@ -1714,6 +1893,12 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
         :return: ZoneContext with all zone-specific info
         :raises StorageError: If zone invalid or access denied
         """
+        # Ensure dicts are not None (safety for mutable default args)
+        if __user__ is None:
+            __user__ = {}
+        if __metadata__ is None:
+            __metadata__ = {}
+
         zone_lower = zone.lower()
         user_root = self._get_user_root(__user__)
         conv_id = self._get_conv_id(__metadata__)
@@ -1811,38 +1996,76 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
         """
         Resolves a relative path within a chroot and verifies it doesn't escape.
         Raises PATH_ESCAPE if escape attempt detected.
+        Also detects symlinks that could point outside the chroot.
         """
         # Clean the path
         relative_path = relative_path.lstrip("/")
-        
-        # Resolve
-        target = (base / relative_path).resolve()
+
+        # Build path without resolving symlinks first
+        raw_path = base / relative_path
+
+        # Check for symlinks in the path that could escape chroot
+        # Walk from base to target, checking each existing component
+        current = base.resolve()
+        parts = Path(relative_path).parts
+        for i, part in enumerate(parts):
+            next_path = current / part
+            if next_path.is_symlink():
+                # Symlink found - resolve it and verify it stays in chroot
+                link_target = next_path.resolve()
+                base_resolved = base.resolve()
+                try:
+                    link_target.relative_to(base_resolved)
+                except ValueError:
+                    raise StorageError(
+                        "PATH_ESCAPE",
+                        "Symlink escape attempt detected",
+                        {"path": relative_path},
+                        "Symlinks pointing outside the zone are not allowed"
+                    )
+            if next_path.exists():
+                current = next_path.resolve()
+            else:
+                # Path doesn't exist yet, remaining parts are for new file/dir
+                break
+
+        # Resolve final path
+        target = raw_path.resolve()
         base_resolved = base.resolve()
-        
+
         # Verify we stay in chroot
         try:
             target.relative_to(base_resolved)
         except ValueError:
             raise StorageError(
                 "PATH_ESCAPE",
-                f"Chroot escape attempt detected",
-                {"path": relative_path, "chroot": str(base)},
+                "Chroot escape attempt detected",
+                {"path": relative_path},
                 "Use only relative paths without ../"
             )
-        
+
         return target
 
-    def _validate_relative_path(self, path: str) -> str:
+    def _validate_relative_path(
+        self,
+        path: str,
+        zone_name: str = None,
+        allow_zone_in_path: bool = False
+    ) -> str:
         """
         Validates that a relative path contains no traversal.
         Returns the cleaned and normalized path.
+
+        :param path: The path to validate
+        :param zone_name: If provided, checks that path doesn't start with zone name
+        :param allow_zone_in_path: If True, allows path to start with zone name
         """
         # Normalize Unicode to NFC (prevents path confusion attacks)
         path = unicodedata.normalize("NFC", path)
-        
+
         # Clean
         path = path.lstrip("/")
-        
+
         # Block absolute paths
         if path.startswith("/"):
             raise StorageError(
@@ -1851,7 +2074,7 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                 {"path": path},
                 "Use only relative paths"
             )
-        
+
         # Block .. that escapes current directory
         # Virtually resolve the path to check
         parts = []
@@ -1867,8 +2090,27 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                 parts.pop()
             elif part and part != ".":
                 parts.append(part)
-        
-        return "/".join(parts) if parts else ""
+
+        cleaned_path = "/".join(parts) if parts else ""
+
+        # Check if path starts with zone name (common LLM mistake)
+        if zone_name and not allow_zone_in_path and parts:
+            # Zone names to check (case-insensitive): Storage, Documents, Uploads
+            # For groups, zone_name is like "group:team-name", we extract just "group"
+            zone_check = zone_name.split(":")[0].lower()
+            first_part_lower = parts[0].lower()
+
+            if first_part_lower == zone_check:
+                raise StorageError(
+                    "PATH_STARTS_WITH_ZONE",
+                    f"Path '{cleaned_path}' starts with zone name '{parts[0]}'",
+                    {"zone": zone_name, "path": cleaned_path, "first_component": parts[0]},
+                    f"The zone parameter already sets the working directory. "
+                    f"Use '{'/'.join(parts[1:])}' instead of '{cleaned_path}'. "
+                    f"If you really want a subfolder named '{parts[0]}', add allow_zone_in_path=True"
+                )
+
+        return cleaned_path
 
     def _validate_group_id(self, group_id: str) -> str:
         """
@@ -2166,7 +2408,8 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                     "ARGUMENT_FORBIDDEN",
                     f"Dangerous argument detected",
                     {"argument": arg_str},
-                    "Characters ; | & && || > >> < << $( ${ ` are forbidden"
+                    "Characters ; | & && || > >> << $( ${ ` are forbidden. "
+                    "Use < for comparisons. To save output to a file, use stdout_file parameter instead of >"
                 )
             
             # Block URLs (network access via ffmpeg, pandoc, imagemagick, etc.)
@@ -2188,57 +2431,77 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                     "This zone is read-only"
                 )
 
-    def _validate_path_args(self, args: list, chroot: Path, cmd: str = "") -> list:
+    def _is_expression_not_path(self, arg: str, cmd: str) -> bool:
+        """
+        Determines if an argument is a regex expression rather than a path.
+        Used for sed/grep/awk commands where /pattern/ syntax is common.
+        """
+        # Commands that use /pattern/ expressions
+        expression_commands = {"sed", "grep", "egrep", "fgrep", "awk", "perl"}
+
+        if cmd not in expression_commands or not arg.startswith("/"):
+            return False
+
+        # Clear expression indicators:
+        # - Contains space: "/Team: Eng/a new line"
+        # - Contains colon: "/Team: Eng/"
+        # - Ends with /: "/pattern/"
+        if " " in arg:
+            return True
+        if ":" in arg:
+            return True
+        if arg.endswith("/"):
+            return True
+
+        if len(arg) > 2:
+            # Check for /pattern/X format where X is a single sed command
+            # Valid: /foo/d, /bar/p, /baz/a text
+            # Invalid: /etc/passwd (passwd is not a single letter)
+            second_slash = arg.find("/", 1)
+            if second_slash > 0 and second_slash < len(arg) - 1:
+                after_slash = arg[second_slash + 1:]
+                # Must be a single sed command letter, alone or followed by space/text
+                if len(after_slash) == 1 and after_slash in "acdipqswy":
+                    return True
+                if len(after_slash) > 1 and after_slash[0] in "acdipqswy" and after_slash[1] in " \t/":
+                    return True
+
+        return False
+
+    def _validate_path_args(
+        self,
+        args: list,
+        chroot: Path,
+        cmd: str = "",
+        zone_name: str = None,
+        allow_zone_in_path: bool = False
+    ) -> list:
         """
         Validates that arguments don't allow escaping the chroot.
         Blocks: absolute paths and .. that escape chroot.
-        
-        For sed/grep/awk, expressions starting with / are NOT treated as paths,
-        but only if they look like expressions (contain space, :, or end with /).
+
+        For sed/grep/awk, expressions starting with / are NOT treated as paths.
+
+        :param args: List of command arguments
+        :param chroot: The zone root path
+        :param cmd: The command being executed
+        :param zone_name: If provided, checks that paths don't start with zone name
+        :param allow_zone_in_path: If True, allows paths to start with zone name
         """
         chroot_resolved = chroot.resolve()
-        
-        # Commands that use /pattern/ expressions
-        expression_commands = {"sed", "grep", "egrep", "fgrep", "awk", "perl"}
-        
+
         for arg in args:
             arg_str = str(arg)
-            
+
             # Skip flags (like -i, -e, -n, etc.)
             if arg_str.startswith("-"):
                 continue
-            
-            # For expression-based commands, detect expressions vs paths
-            if cmd in expression_commands and arg_str.startswith("/"):
-                # Clear expression indicators:
-                # - Contains space: "/Team: Eng/a new line"
-                # - Contains colon: "/Team: Eng/"  
-                # - Ends with /: "/pattern/"
-                is_expression = False
-                
-                if " " in arg_str:
-                    is_expression = True
-                elif ":" in arg_str:
-                    is_expression = True
-                elif arg_str.endswith("/"):
-                    is_expression = True
-                elif len(arg_str) > 2:
-                    # Check for /pattern/X format where X is a single sed command
-                    # Valid: /foo/d, /bar/p, /baz/a text
-                    # Invalid: /etc/passwd (passwd is not a single letter)
-                    second_slash = arg_str.find("/", 1)
-                    if second_slash > 0 and second_slash < len(arg_str) - 1:
-                        after_slash = arg_str[second_slash + 1:]
-                        # Must be a single sed command letter, alone or followed by space/text
-                        if len(after_slash) == 1 and after_slash in "acdipqswy":
-                            is_expression = True
-                        elif len(after_slash) > 1 and after_slash[0] in "acdipqswy" and after_slash[1] in " \t/":
-                            is_expression = True
-                
-                if is_expression:
-                    continue
-            
-            # Block absolute paths
+
+            # Skip regex expressions for sed/grep/awk
+            if self._is_expression_not_path(arg_str, cmd):
+                continue
+
+            # Block absolute paths (that aren't expressions)
             if arg_str.startswith("/"):
                 raise StorageError(
                     "PATH_ESCAPE",
@@ -2246,8 +2509,12 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                     {"path": arg_str},
                     "Use only relative paths"
                 )
-            
-            # Verify .. doesn't escape chroot
+
+            # Use _validate_relative_path for standard validation + zone prefix check
+            # This validates: Unicode normalization, .., and zone prefix
+            self._validate_relative_path(arg_str, zone_name, allow_zone_in_path)
+
+            # Additional chroot escape check with resolved paths
             if ".." in arg_str:
                 try:
                     target = (chroot / arg_str).resolve()
@@ -2256,10 +2523,10 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                     raise StorageError(
                         "PATH_ESCAPE",
                         "Chroot escape attempt detected",
-                        {"path": arg_str, "chroot": str(chroot)},
+                        {"path": arg_str},
                         "Resolved path escapes allowed zone"
                     )
-        
+
         return list(args)
 
     def _validate_git_command(self, args: list) -> None:
@@ -2314,6 +2581,31 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                  "allowed_write": sorted(GIT_WHITELIST_WRITE)}
             )
 
+    def _calculate_effective_max(self, max_output: int) -> int:
+        """Calculate effective max output size based on user parameter and valve limits."""
+        # LLM Guardrail: validate type before use
+        if max_output is not None and not isinstance(max_output, int):
+            raise StorageError(
+                "INVALID_PARAMETER",
+                f"max_output must be an integer or None, got: {repr(max_output)} ({type(max_output).__name__})",
+                hint="Omit max_output or use an integer like max_output=50000"
+            )
+        if max_output is None:
+            return self.valves.max_output_default
+        elif max_output == 0:
+            return self.valves.max_output_absolute
+        else:
+            return min(max_output, self.valves.max_output_absolute)
+
+    def _truncate_output(self, output: str, effective_max: int) -> tuple:
+        """Truncate output if it exceeds effective_max. Returns (output, was_truncated)."""
+        if not output:
+            return "", False
+        if len(output) > effective_max:
+            truncated = output[:effective_max] + f"\n\n... [TRUNCATED - {len(output)} bytes total, showing first {effective_max}] ..."
+            return truncated, True
+        return output, False
+
     def _exec_command(
         self, 
         cmd: str, 
@@ -2337,11 +2629,13 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
             stderr_file: Path to redirect stderr to (None=capture in memory)
             redirect_stderr_to_stdout: If True, redirect stderr to stdout (2>&1)
         """
+        # Pre-compute args_str once for all checks
+        args_str = " ".join(str(a) for a in args)
+
         # Handle tar extraction: add --no-same-owner to prevent ownership errors
         # This avoids "Cannot change ownership" errors that cause tar to return code 2
         # even though files are extracted successfully
         if cmd == "tar":
-            args_str = " ".join(str(a) for a in args)
             is_extraction = any(x in args_str for x in ["-x", "--extract"])
             # Also check combined flags like -xJf, -xzf, etc.
             if not is_extraction:
@@ -2352,11 +2646,10 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                         break
             if is_extraction and "--no-same-owner" not in args_str:
                 args = ["--no-same-owner"] + list(args)
-        
+
         # Handle curl: require -o/--output to prevent stdout pollution
         # Also add -sS to suppress progress but show errors
         if cmd == "curl":
-            args_str = " ".join(str(a) for a in args)
             # Check for output redirection (allow if stdout_file is specified)
             has_output = any(x in args_str for x in ["-o", "--output", "-O", "--remote-name"]) or stdout_file
             if not has_output:
@@ -2368,11 +2661,10 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                 )
             if "-s" not in args_str and "--silent" not in args_str:
                 args = ["-sS"] + list(args)  # -s=silent, -S=show-error
-        
+
         # Handle wget: require -O/--output-document to prevent stdout pollution
         # Also add -q to suppress progress
         if cmd == "wget":
-            args_str = " ".join(str(a) for a in args)
             # Check for output redirection (allow if stdout_file is specified)
             has_output = any(x in args_str for x in ["-O", "--output-document"]) or stdout_file
             if not has_output:
@@ -2452,20 +2744,9 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                 stdout = f"[Output written to {stdout_file.name}]"
                 stdout_truncated = False
             else:
-                # Truncate stdout if too long (prevents context pollution)
-                if max_output is None:
-                    effective_max = self.valves.max_output_default
-                elif max_output == 0:
-                    effective_max = self.valves.max_output_absolute
-                else:
-                    effective_max = min(max_output, self.valves.max_output_absolute)
-                
-                stdout = result.stdout or ""
-                stdout_truncated = False
-                if len(stdout) > effective_max:
-                    stdout = stdout[:effective_max] + f"\n\n... [TRUNCATED - {len(result.stdout)} bytes total, showing first {effective_max}] ..."
-                    stdout_truncated = True
-            
+                effective_max = self._calculate_effective_max(max_output)
+                stdout, stdout_truncated = self._truncate_output(result.stdout or "", effective_max)
+
             # Get stderr content
             if stderr_file:
                 stderr = f"[Errors written to {stderr_file.name}]"
@@ -2474,18 +2755,8 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                 stderr = ""
                 stderr_truncated = False
             else:
-                if max_output is None:
-                    effective_max = self.valves.max_output_default
-                elif max_output == 0:
-                    effective_max = self.valves.max_output_absolute
-                else:
-                    effective_max = min(max_output, self.valves.max_output_absolute)
-                
-                stderr = result.stderr or ""
-                stderr_truncated = False
-                if len(stderr) > effective_max:
-                    stderr = stderr[:effective_max] + f"\n\n... [TRUNCATED - {len(result.stderr)} bytes total, showing first {effective_max}] ..."
-                    stderr_truncated = True
+                effective_max = self._calculate_effective_max(max_output)
+                stderr, stderr_truncated = self._truncate_output(result.stderr or "", effective_max)
             
             response = {
                 "success": result.returncode == 0,
@@ -2522,18 +2793,21 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                 {"command": cmd},
                 "Use shed_allowed_commands() to see available commands"
             )
-        except Exception as e:
+        except StorageError:
+            # Re-raise StorageError (e.g., from _calculate_effective_max validation)
+            raise
+        except Exception:
             raise StorageError(
                 "EXEC_ERROR",
-                f"Execution error: {str(e)}",
-                {"command": cmd, "error": str(e)}
+                "Execution error",
+                {"command": cmd}
             )
         finally:
             # Ensure files are closed on error
             for f in files_to_close:
                 try:
                     f.close()
-                except:
+                except OSError:
                     pass
 
     def _ensure_dir(self, path: Path) -> None:
@@ -2589,13 +2863,8 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                 if existing_lock.get("conv_id") != conv_id:
                     raise StorageError(
                         "FILE_LOCKED",
-                        f"File locked by another conversation",
-                        {
-                            "locked_by": existing_lock.get("user_id"),
-                            "locked_at": existing_lock.get("locked_at"),
-                            "conv_id": existing_lock.get("conv_id"),
-                            "path": existing_lock.get("path"),
-                        },
+                        "File locked by another conversation",
+                        {"locked_at": existing_lock.get("locked_at")},
                         "Wait or use shed_force_unlock() / shed_maintenance()"
                     )
                 # Same conversation - can proceed (re-lock)
@@ -2610,8 +2879,20 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
             # os.open with O_CREAT | O_EXCL is atomic
             fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
             try:
-                os.write(fd, json.dumps(lock_data, indent=2).encode('utf-8'))
-            finally:
+                lock_content = json.dumps(lock_data, indent=2).encode('utf-8')
+                bytes_written = os.write(fd, lock_content)
+                # Ensure complete write
+                if bytes_written != len(lock_content):
+                    raise OSError("Partial write to lock file")
+            except Exception:
+                # Write failed - remove corrupt lock file
+                os.close(fd)
+                try:
+                    lock_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+            else:
                 os.close(fd)
         except FileExistsError:
             # Race condition: another process created the lock between our check and create
@@ -2621,17 +2902,23 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                 if existing_lock.get("conv_id") != conv_id:
                     raise StorageError(
                         "FILE_LOCKED",
-                        f"File locked by another conversation",
+                        "File locked by another conversation",
                         {
-                            "locked_by": existing_lock.get("user_id"),
                             "locked_at": existing_lock.get("locked_at"),
-                            "conv_id": existing_lock.get("conv_id"),
                         },
                         "Wait or use shed_force_unlock() / shed_maintenance()"
                     )
-            except (json.JSONDecodeError, FileNotFoundError):
-                # Lock was corrupted or removed - try again
-                lock_path.write_text(json.dumps(lock_data, indent=2))
+            except (json.JSONDecodeError, FileNotFoundError, OSError, PermissionError):
+                # Lock was corrupted, removed, or unreadable - try to claim it
+                try:
+                    lock_path.write_text(json.dumps(lock_data, indent=2))
+                except OSError:
+                    # Cannot write lock file - propagate as storage error
+                    raise StorageError(
+                        "LOCK_ERROR",
+                        "Cannot acquire lock",
+                        hint="Check file permissions"
+                    )
 
     def _check_lock_owner(self, lock_path: Path, user_id: str) -> None:
         """
@@ -2645,19 +2932,50 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                     raise StorageError(
                         "NOT_LOCK_OWNER",
                         "You don't own this lock",
-                        {"locked_by": lock_data.get("user_id"), "your_id": user_id},
+                        None,
                         "Only the user who opened the file can save/cancel"
                     )
-            except json.JSONDecodeError:
-                pass  # Corrupted lock, allow operation
+            except (json.JSONDecodeError, OSError, PermissionError):
+                pass  # Corrupted or unreadable lock, allow operation
+
+    def _release_lock(self, lock_path: Path) -> None:
+        """
+        Releases a lock file. Safe to call even if lock doesn't exist.
+        This is the counterpart to _acquire_lock().
+        """
+        try:
+            lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass  # Ignore errors when releasing lock
+
+    def _check_file_not_locked(self, editzone_base: Path, path: str, conv_id: str) -> None:
+        """
+        Checks if a file is locked by another conversation.
+        Raises FILE_LOCKED if the file is locked by a different conversation.
+        Used by shed_delete and shed_rename to prevent operations on locked files.
+        """
+        lock_path = self._get_lock_path(editzone_base, path)
+        if lock_path.exists():
+            try:
+                lock_data = json.loads(lock_path.read_text())
+                if lock_data.get("conv_id") != conv_id:
+                    raise StorageError(
+                        "FILE_LOCKED",
+                        "File locked by another conversation",
+                        {"locked_at": lock_data.get("locked_at")},
+                        "Wait for the other session to release the lock or use shed_force_unlock()"
+                    )
+            except (json.JSONDecodeError, OSError, PermissionError):
+                pass  # Corrupted or unreadable lock, allow operation
 
     def _validate_content_size(self, content: str) -> None:
         """Checks that content doesn't exceed max size."""
         max_bytes = self.valves.max_file_size_mb * 1024 * 1024
-        if len(content.encode('utf-8')) > max_bytes:
+        content_size = len(content.encode('utf-8'))
+        if content_size > max_bytes:
             raise StorageError(
                 "FILE_TOO_LARGE",
-                f"Content too large ({len(content.encode('utf-8')) / 1024 / 1024:.2f} MB)",
+                f"Content too large ({content_size / 1024 / 1024:.2f} MB)",
                 {"max_mb": self.valves.max_file_size_mb},
                 f"Max size is {self.valves.max_file_size_mb} MB"
             )
@@ -2750,12 +3068,29 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                 timeout=timeout,
             )
             return result
+        except FileNotFoundError:
+            raise StorageError(
+                "GIT_NOT_AVAILABLE",
+                "Git is not installed or not in PATH",
+                hint="Install git or contact administrator"
+            )
+        except PermissionError:
+            raise StorageError(
+                "PERMISSION_DENIED",
+                "Cannot execute git command",
+                hint="Check file permissions"
+            )
+        except OSError:
+            raise StorageError(
+                "EXECUTION_ERROR",
+                "Failed to execute git command",
+                hint="Check system configuration"
+            )
         except subprocess.TimeoutExpired:
             raise StorageError(
                 "TIMEOUT",
                 f"Git command timed out after {timeout}s",
-                {"command": ["git"] + args},
-                "Try a simpler operation or increase timeout"
+                hint="Try a simpler operation or increase timeout"
             )
 
     def _check_command_available(self, cmd: str) -> bool:
@@ -2763,15 +3098,7 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
         Layer 2: Checks if a command is available on the system.
         Used for introspection (shed_allowed_commands).
         """
-        try:
-            result = subprocess.run(
-                ["which", cmd],
-                capture_output=True,
-                timeout=5,
-            )
-            return result.returncode == 0
-        except Exception:
-            return False
+        return shutil.which(cmd) is not None
 
     def _init_git_repo(self, repo_path: Path) -> None:
         """Initializes a Git repository if needed."""
@@ -2792,7 +3119,6 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
         hooks_path = repo_path / ".git" / "hooks"
         if hooks_path.exists():
             # Remove all hook files (they could be malicious)
-            import shutil
             shutil.rmtree(hooks_path, ignore_errors=True)
             # Recreate empty hooks directory
             hooks_path.mkdir(exist_ok=True)
@@ -2886,7 +3212,19 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                 "Group features are not available",
                 hint="Open WebUI Groups API not found"
             )
-        
+
+        # Check if group exists first
+        group_obj = Groups.get_group_by_id(group_id)
+        if group_obj is None:
+            raise StorageError(
+                "GROUP_NOT_FOUND",
+                f"Group not found: '{group_id}'",
+                {"group_id": group_id},
+                "Check the group name or ID"
+            )
+
+        if __user__ is None:
+            __user__ = {}
         user_id = __user__.get("id", "")
         if not self._is_group_member(user_id, group_id):
             raise StorageError(
@@ -3055,6 +3393,13 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
 
     def _clamp_timeout(self, timeout: int = None) -> int:
         """Clamps timeout to configured values. Uses exec_timeout_default if not specified."""
+        # LLM Guardrail: validate type before use
+        if timeout is not None and not isinstance(timeout, int):
+            raise StorageError(
+                "INVALID_PARAMETER",
+                f"timeout must be an integer or None, got: {repr(timeout)} ({type(timeout).__name__})",
+                hint="Omit timeout or use an integer like timeout=30"
+            )
         if timeout is None:
             timeout = self.valves.exec_timeout_default
         return max(1, min(timeout, self.valves.exec_timeout_max))
@@ -3157,10 +3502,10 @@ Only use shed_patch_text() to CREATE or MODIFY file CONTENT.
 | Count lines        | shed_exec(zone="storage", cmd="wc", args=["-l", "file"])  |
 | Git operations     | shed_exec(zone="documents", cmd="git", args=["log"])      |
 
-CONTENT OPERATIONS (use shed_patch_text only for these):
+CONTENT OPERATIONS:
 | Operation              | Method                                                  |
 |------------------------|---------------------------------------------------------|
-| Create new file        | shed_patch_text(zone, path, content, overwrite=True)    |
+| Create new file        | shed_create_file(zone, path, content)                   |
 | Append to file         | shed_patch_text(zone, path, content, position="end")    |
 | Replace pattern        | shed_patch_text(zone, path, content, pattern="...", position="replace") |
 | Edit specific line     | shed_patch_text(zone, path, content, line=5, position="replace") |
@@ -3383,26 +3728,39 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
         group: str,
         message: str,
         mode: str,
+        allow_zone_in_path: bool,
         __user__: dict,
         __metadata__: dict,
     ) -> str:
         """Internal implementation for text file patching."""
+        if __user__ is None:
+            __user__ = {}
+        if __metadata__ is None:
+            __metadata__ = {}
         user_id = __user__.get("id", "")
         conv_id = self._get_conv_id(__metadata__)
+
+        # Early validation
+        if not path or path.strip() == "":
+            raise StorageError("MISSING_PARAMETER", "Path parameter is required")
+
         zone_lower = zone.lower()
-        
+
         # === ZONE RESOLUTION ===
         user_root = self._get_user_root(__user__)
         git_commit = False
         group_id = None
-        
+        zone_name = None  # For zone prefix validation
+
         if zone_lower == "storage":
             zone_root = user_root / "Storage" / "data"
             editzone_base = user_root / "Storage"
+            zone_name = "Storage"
         elif zone_lower == "documents":
             zone_root = user_root / "Documents" / "data"
             editzone_base = user_root / "Documents"
             git_commit = True
+            zone_name = "Documents"
             self._init_git_repo(zone_root)
         elif zone_lower == "group":
             if not group:
@@ -3412,13 +3770,16 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
             zone_root = self._ensure_group_space(group_id)
             editzone_base = self._get_groups_root() / group_id
             git_commit = True
+            zone_name = f"Group:{group_id}"
+        elif zone_lower == "uploads":
+            raise StorageError("ZONE_READONLY", "Uploads zone is read-only", hint="Use storage or documents zone for writing")
         else:
-            raise StorageError("ZONE_FORBIDDEN", f"Invalid zone: {zone}")
-        
+            raise StorageError("INVALID_ZONE", f"Invalid zone: {zone}", hint="Use one of: uploads, storage, documents, group")
+
         self._ensure_dir(zone_root)
-        path = self._validate_relative_path(path)
+        path = self._validate_relative_path(path, zone_name, allow_zone_in_path)
         target_path = self._resolve_chroot_path(zone_root, path)
-        
+
         # === PERMISSION CHECK (groups) ===
         if group_id:
             can_write, error = self._can_write_group_file(group_id, path, user_id)
@@ -3426,40 +3787,65 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
                 raise StorageError(error, f"Cannot write to file: {error}")
         
         # === VALIDATE PARAMETERS ===
+        if content is None:
+            raise StorageError("MISSING_PARAMETER", "Content parameter is required")
+
+        # Skip position/line/end_line/pattern validation when overwrite=True (these params are ignored)
         valid_positions = ("start", "end", "before", "after", "replace")
-        if position not in valid_positions:
+        if not overwrite and position not in valid_positions:
             hint = ""
             if position == "overwrite":
                 hint = ". To overwrite entire file, use overwrite=True parameter instead"
             elif position == "at":
                 hint = ". 'at' is for shed_patch_bytes (binary). For text, use 'before' or 'after' with line=N"
             raise StorageError(
-                "INVALID_PARAMETER", 
+                "INVALID_PARAMETER",
                 f"Invalid position: {position}. Valid: {', '.join(valid_positions)}{hint}"
             )
-        
-        # Treat 0 as None (LLMs sometimes pass 0 instead of omitting the parameter)
-        if line == 0:
-            line = None
-        if end_line == 0:
-            end_line = None
-        
-        if not overwrite and position in ("before", "after", "replace"):
-            if line is None and pattern is None:
-                raise StorageError("MISSING_PARAMETER", f"Position '{position}' requires 'line' or 'pattern'")
-        
-        if line is not None and line < 1:
-            raise StorageError("INVALID_PARAMETER", "Line must be >= 1 (first line is 1, not 0)")
-        
-        if end_line is not None and position != "replace":
-            raise StorageError("INVALID_PARAMETER", "end_line only valid with position='replace'")
-        
-        if end_line is not None and end_line < line:
-            raise StorageError("INVALID_PARAMETER", "end_line must be >= line")
-        
+        if not overwrite:
+            # LLM Guardrail: validate types before comparison
+            if line is not None and not isinstance(line, int):
+                raise StorageError(
+                    "INVALID_PARAMETER",
+                    f"line must be an integer or None, got: {repr(line)} ({type(line).__name__})",
+                    hint="Use line=1 for first line, line=2 for second, etc."
+                )
+            if end_line is not None and not isinstance(end_line, int):
+                raise StorageError(
+                    "INVALID_PARAMETER",
+                    f"end_line must be an integer or None, got: {repr(end_line)} ({type(end_line).__name__})",
+                    hint="Use end_line=5 to replace lines up to line 5"
+                )
+
+            # Validate line parameter - line=0 is explicitly invalid
+            if line is not None and line < 1:
+                raise StorageError("INVALID_PARAMETER", "Line must be >= 1 (first line is 1, not 0)")
+
+            if end_line is not None and end_line < 1:
+                raise StorageError("INVALID_PARAMETER", "end_line must be >= 1 (first line is 1, not 0)")
+
+            if position in ("before", "after", "replace"):
+                if line is None and pattern is None:
+                    raise StorageError("MISSING_PARAMETER", f"Position '{position}' requires 'line' or 'pattern'")
+
+            if end_line is not None and position != "replace":
+                raise StorageError("INVALID_PARAMETER", "end_line only valid with position='replace'")
+
+            if end_line is not None and end_line < line:
+                raise StorageError("INVALID_PARAMETER", "end_line must be >= line")
+
         # === COMPILE REGEX ===
         compiled_pattern = None
-        if pattern is not None:
+        if pattern is not None and not overwrite:
+            if pattern == "":
+                raise StorageError("INVALID_PARAMETER", "Pattern cannot be empty")
+            # LLM Guardrail: validate regex_flags type
+            if not isinstance(regex_flags, str):
+                raise StorageError(
+                    "INVALID_PARAMETER",
+                    f"regex_flags must be a string, got: {repr(regex_flags)} ({type(regex_flags).__name__})",
+                    hint="Use regex_flags='i' for case-insensitive, 'im' for multiline, or '' for none"
+                )
             flags = 0
             for c in regex_flags.lower():
                 if c == 'i': flags |= re.IGNORECASE
@@ -3467,13 +3853,16 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
                 elif c == 's': flags |= re.DOTALL
             try:
                 compiled_pattern = re.compile(pattern, flags)
-            except re.error as e:
-                raise StorageError("INVALID_PARAMETER", f"Invalid regex: {e}")
+            except re.error:
+                raise StorageError("INVALID_PARAMETER", "Invalid regex pattern", hint="Check regex syntax")
         
         # === CHECK FILE EXISTS ===
         file_exists = target_path.exists()
         file_created = False
-        
+
+        if file_exists and target_path.is_dir():
+            raise StorageError("NOT_A_FILE", f"Path is a directory, not a file: {path}")
+
         if not file_exists:
             if overwrite or position in ("start", "end"):
                 file_created = True
@@ -3483,7 +3872,10 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
         # === SIZE AND QUOTA CHECKS ===
         content_bytes = content.encode('utf-8')
         max_size = self.valves.max_file_size_mb * 1024 * 1024
-        current_size = target_path.stat().st_size if file_exists else 0
+        try:
+            current_size = target_path.stat().st_size if file_exists else 0
+        except FileNotFoundError:
+            current_size = 0
         
         if current_size + len(content_bytes) > max_size:
             raise StorageError("FILE_TOO_LARGE", f"File would exceed {self.valves.max_file_size_mb} MB")
@@ -3496,26 +3888,30 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
         # === SAFE MODE SETUP ===
         lock_path = None
         working_path = target_path
-        
+
         if safe:
             rel_path = str(target_path.relative_to(zone_root))
             lock_path = editzone_base / "locks" / (rel_path + ".lock")
             edit_path = editzone_base / "editzone" / conv_id / rel_path
-            
+
             self._acquire_lock(lock_path, conv_id, user_id, rel_path)
-            self._ensure_dir(edit_path.parent)
-            
-            if file_exists:
-                shutil.copy2(target_path, edit_path)
-            else:
-                edit_path.touch()
-            working_path = edit_path
+            # NOTE: All operations after lock acquisition must be inside try block
+            # to ensure lock release on failure
         else:
             if file_created:
                 self._ensure_dir(target_path.parent)
                 target_path.touch()
-        
+
         try:
+            # === SAFE MODE EDITZONE SETUP (inside try for lock cleanup) ===
+            if safe:
+                self._ensure_dir(edit_path.parent)
+                if file_exists:
+                    shutil.copy2(target_path, edit_path)
+                else:
+                    edit_path.touch()
+                working_path = edit_path
+
             # === READ CONTENT ===
             if overwrite:
                 lines = []
@@ -3586,19 +3982,24 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
                     lines_affected = end_idx - start_idx + 1
                     lines = lines[:start_idx] + [content] + lines[end_idx + 1:]
                 else:
-                    new_lines = []
-                    found = False
-                    for l in lines:
-                        if compiled_pattern.search(l) and (not found or match_all):
-                            new_lines.append(content)
-                            lines_affected += 1
-                            match_count += 1
-                            found = True
-                        else:
-                            new_lines.append(l)
-                    if not found:
+                    # Search and replace in full content (supports multiline patterns)
+                    full_content = ''.join(lines)
+                    if not compiled_pattern.search(full_content):
                         raise StorageError("PATTERN_NOT_FOUND", f"Pattern not found: {pattern}")
-                    lines = new_lines
+
+                    # Count replacements and perform substitution
+                    if match_all:
+                        new_content, match_count = compiled_pattern.subn(content, full_content)
+                    else:
+                        new_content, match_count = compiled_pattern.subn(content, full_content, count=1)
+
+                    lines_affected = match_count
+                    # Split back into lines, preserving line structure
+                    if new_content.endswith('\n'):
+                        lines = [l + '\n' for l in new_content[:-1].split('\n')]
+                    else:
+                        parts = new_content.split('\n')
+                        lines = [l + '\n' for l in parts[:-1]] + [parts[-1]] if len(parts) > 1 else [new_content]
             
             # === WRITE RESULT ===
             with open(working_path, 'w', encoding='utf-8') as f:
@@ -3608,8 +4009,7 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
             if safe:
                 self._ensure_dir(target_path.parent)
                 shutil.move(str(working_path), str(target_path))
-                lock_path.unlink(missing_ok=True)
-            
+
             # === GIT COMMIT ===
             if git_commit:
                 commit_msg = message or f"Patch {path}: {position}"
@@ -3644,8 +4044,15 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
             return self._format_response(True, data=result, message=f"File {action}: {lines_affected} line(s) affected")
             
         finally:
-            if safe and lock_path and lock_path.exists():
-                lock_path.unlink(missing_ok=True)
+            # Cleanup on error: release lock and remove editzone if it wasn't moved
+            if safe and lock_path:
+                self._release_lock(lock_path)
+                # Clean up editzone if it still exists (wasn't successfully moved)
+                if 'edit_path' in dir() and edit_path.exists():
+                    try:
+                        edit_path.unlink()
+                    except OSError:
+                        pass
 
     async def _patch_bytes_impl(
         self,
@@ -3656,20 +4063,33 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
         offset: int,
         length: int,
         content_format: str,
+        overwrite: bool,
         safe: bool,
         group: str,
         message: str,
         mode: str,
+        allow_zone_in_path: bool,
         __user__: dict,
         __metadata__: dict,
     ) -> str:
         """Internal implementation for binary file patching."""
         import base64 as base64_module
-        
+
+        if __user__ is None:
+            __user__ = {}
+        if __metadata__ is None:
+            __metadata__ = {}
         user_id = __user__.get("id", "")
         conv_id = self._get_conv_id(__metadata__)
+
+        # Early validation
+        if content is None:
+            raise StorageError("MISSING_PARAMETER", "Content parameter is required")
+        if not path or path.strip() == "":
+            raise StorageError("MISSING_PARAMETER", "Path parameter is required")
+
         zone_lower = zone.lower()
-        
+
         # === PARSE CONTENT ===
         try:
             if content_format == "hex":
@@ -3683,21 +4103,24 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
                 content_bytes = content.encode('utf-8')
             else:
                 raise StorageError("INVALID_PARAMETER", f"Invalid content_format: {content_format}")
-        except ValueError as e:
-            raise StorageError("INVALID_PARAMETER", f"Invalid content: {e}")
-        
+        except ValueError:
+            raise StorageError("INVALID_PARAMETER", "Invalid content encoding", hint=f"Content must be valid {content_format}")
+
         # === ZONE RESOLUTION ===
         user_root = self._get_user_root(__user__)
         git_commit = False
         group_id = None
-        
+        zone_name = None  # For zone prefix validation
+
         if zone_lower == "storage":
             zone_root = user_root / "Storage" / "data"
             editzone_base = user_root / "Storage"
+            zone_name = "Storage"
         elif zone_lower == "documents":
             zone_root = user_root / "Documents" / "data"
             editzone_base = user_root / "Documents"
             git_commit = True
+            zone_name = "Documents"
             self._init_git_repo(zone_root)
         elif zone_lower == "group":
             if not group:
@@ -3707,13 +4130,16 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
             zone_root = self._ensure_group_space(group_id)
             editzone_base = self._get_groups_root() / group_id
             git_commit = True
+            zone_name = f"Group:{group_id}"
+        elif zone_lower == "uploads":
+            raise StorageError("ZONE_READONLY", "Uploads zone is read-only", hint="Use storage or documents zone for writing")
         else:
-            raise StorageError("ZONE_FORBIDDEN", f"Invalid zone: {zone}")
-        
+            raise StorageError("INVALID_ZONE", f"Invalid zone: {zone}", hint="Use one of: uploads, storage, documents, group")
+
         self._ensure_dir(zone_root)
-        path = self._validate_relative_path(path)
+        path = self._validate_relative_path(path, zone_name, allow_zone_in_path)
         target_path = self._resolve_chroot_path(zone_root, path)
-        
+
         # === PERMISSION CHECK ===
         if group_id:
             can_write, error = self._can_write_group_file(group_id, path, user_id)
@@ -3721,25 +4147,40 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
                 raise StorageError(error, f"Cannot write to file: {error}")
         
         # === VALIDATE PARAMETERS ===
+        # Skip position/offset/length validation when overwrite=True (these params are ignored)
         valid_positions = ("start", "end", "at", "replace")
-        if position not in valid_positions:
+        if not overwrite and position not in valid_positions:
             hint = ""
             if position == "overwrite":
                 hint = ". To overwrite entire file, use overwrite=True parameter instead"
             raise StorageError(
-                "INVALID_PARAMETER", 
+                "INVALID_PARAMETER",
                 f"Invalid position: {position}. Valid: {', '.join(valid_positions)}{hint}"
             )
-        
-        if position in ("at", "replace") and offset is None:
+
+        if not overwrite and position in ("at", "replace") and offset is None:
             raise StorageError("MISSING_PARAMETER", f"Position '{position}' requires 'offset'")
-        
-        if position == "replace" and length is None:
+
+        if not overwrite and position == "replace" and length is None:
             raise StorageError("MISSING_PARAMETER", "Position 'replace' requires 'length'")
-        
+
+        # LLM Guardrail: validate types before comparison
+        if offset is not None and not isinstance(offset, int):
+            raise StorageError(
+                "INVALID_PARAMETER",
+                f"offset must be an integer or None, got: {repr(offset)} ({type(offset).__name__})",
+                hint="Use offset=0 for start of file, offset=100 for byte 100, etc."
+            )
+        if length is not None and not isinstance(length, int):
+            raise StorageError(
+                "INVALID_PARAMETER",
+                f"length must be an integer or None, got: {repr(length)} ({type(length).__name__})",
+                hint="Use length=10 to replace 10 bytes"
+            )
+
         if offset is not None and offset < 0:
             raise StorageError("INVALID_PARAMETER", "Offset must be >= 0")
-        
+
         if length is not None and length < 0:
             raise StorageError("INVALID_PARAMETER", "Length must be >= 0")
         
@@ -3755,9 +4196,13 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
         
         # === SIZE CHECKS ===
         max_size = self.valves.max_file_size_mb * 1024 * 1024
-        current_size = target_path.stat().st_size if file_exists else 0
-        
-        if offset is not None and offset > current_size:
+        try:
+            current_size = target_path.stat().st_size if file_exists else 0
+        except FileNotFoundError:
+            current_size = 0
+
+        # Only validate offset bounds when it will actually be used
+        if offset is not None and position in ("at", "replace") and offset > current_size:
             raise StorageError("INVALID_PARAMETER", f"Offset {offset} beyond file size ({current_size})")
         
         bytes_removed = 0
@@ -3775,26 +4220,30 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
         # === SAFE MODE SETUP ===
         lock_path = None
         working_path = target_path
-        
+
         if safe:
             rel_path = str(target_path.relative_to(zone_root))
             lock_path = editzone_base / "locks" / (rel_path + ".lock")
             edit_path = editzone_base / "editzone" / conv_id / rel_path
-            
+
             self._acquire_lock(lock_path, conv_id, user_id, rel_path)
-            self._ensure_dir(edit_path.parent)
-            
-            if file_exists:
-                shutil.copy2(target_path, edit_path)
-            else:
-                edit_path.touch()
-            working_path = edit_path
+            # NOTE: All operations after lock acquisition must be inside try block
+            # to ensure lock release on failure
         else:
             if file_created:
                 self._ensure_dir(target_path.parent)
                 target_path.touch()
-        
+
         try:
+            # === SAFE MODE EDITZONE SETUP (inside try for lock cleanup) ===
+            if safe:
+                self._ensure_dir(edit_path.parent)
+                if file_exists:
+                    shutil.copy2(target_path, edit_path)
+                else:
+                    edit_path.touch()
+                working_path = edit_path
+
             # === READ DATA ===
             if file_created and not safe:
                 data = bytearray()
@@ -3805,7 +4254,10 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
             bytes_affected = len(content_bytes)
             
             # === PERFORM EDIT ===
-            if position == "start":
+            if overwrite:
+                # Complete file replacement
+                data = bytearray(content_bytes)
+            elif position == "start":
                 data = bytearray(content_bytes) + data
             elif position == "end":
                 data.extend(content_bytes)
@@ -3824,8 +4276,7 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
             if safe:
                 self._ensure_dir(target_path.parent)
                 shutil.move(str(working_path), str(target_path))
-                lock_path.unlink(missing_ok=True)
-            
+
             # === GIT COMMIT ===
             if git_commit:
                 commit_msg = message or f"Patch bytes {path}: {position}"
@@ -3845,7 +4296,7 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
             result = {
                 "path": path,
                 "zone": zone,
-                "position": position,
+                "position": "overwrite" if overwrite else position,
                 "bytes_written": len(content_bytes),
                 "bytes_affected": bytes_affected,
                 "created": file_created,
@@ -3853,17 +4304,25 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
                 "safe_mode": safe,
                 "content_format": content_format,
             }
-            if offset is not None:
+            if offset is not None and not overwrite:
                 result["offset"] = offset
             if group_id:
                 result["group"] = group_id
-            
-            return self._format_response(True, data=result, 
-                message=f"File {'created' if file_created else 'patched'}: {len(content_bytes)} bytes written")
+
+            action = "created" if file_created else ("overwritten" if overwrite else "patched")
+            return self._format_response(True, data=result,
+                message=f"File {action}: {len(content_bytes)} bytes written")
             
         finally:
-            if safe and lock_path and lock_path.exists():
-                lock_path.unlink(missing_ok=True)
+            # Cleanup on error: release lock and remove editzone if it wasn't moved
+            if safe and lock_path:
+                self._release_lock(lock_path)
+                # Clean up editzone if it still exists (wasn't successfully moved)
+                if 'edit_path' in dir() and edit_path.exists():
+                    try:
+                        edit_path.unlink()
+                    except OSError:
+                        pass
 
 
     # =========================================================================
@@ -3913,8 +4372,8 @@ class Tools:
     ║    • Delete: shed_exec(zone="storage", cmd="rm", args=["file.txt"])      ║
     ║    • Git:    shed_exec(zone="documents", cmd="git", args=["log"])        ║
     ║                                                                           ║
-    ║  Use shed_patch_text() ONLY for file CONTENT operations:                 ║
-    ║    • Create: shed_patch_text(zone, path, content, overwrite=True)        ║
+    ║  FILE CONTENT operations:                                                ║
+    ║    • Create: shed_create_file(zone, path, content)                       ║
     ║    • Append: shed_patch_text(zone, path, content, position="end")        ║
     ║                                                                           ║
     ║  ❌ WRONG: shed_patch_text(path="dir/.keep") to create directories        ║
@@ -4020,19 +4479,20 @@ class Tools:
         self,
         zone: str,
         cmd: str,
-        args: list = [],
+        args: list = None,
         timeout: int = None,
         max_output: int = None,
         stdout_file: str = None,
         stderr_file: str = None,
         redirect_stderr_to_stdout: bool = False,
         group: str = None,
-        __user__: dict = {},
-        __metadata__: dict = {},
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Execute a command in the specified zone.
-        
+
         :param zone: Target zone ("uploads", "storage", "documents", or "group")
         :param cmd: Command to execute (must be in whitelist)
         :param args: Command arguments - file paths go here
@@ -4042,8 +4502,12 @@ class Tools:
         :param stderr_file: Save stderr to this file instead of returning it
         :param redirect_stderr_to_stdout: Merge stderr into stdout (like 2>&1)
         :param group: Group name/ID (required if zone="group")
+        :param allow_zone_in_path: Allow paths starting with zone name (default: False).
+            By default, paths like "Documents/folder" in zone="documents" are rejected
+            to prevent accidental duplication. Set True only if you really want a
+            subfolder named after the zone.
         :return: Command output as JSON
-        
+
         Examples:
             shed_exec(zone="uploads", cmd="cat", args=["file.txt"])
             shed_exec(zone="storage", cmd="ls", args=["-la"])
@@ -4051,26 +4515,31 @@ class Tools:
             shed_exec(zone="storage", cmd="grep", args=["-r", "TODO", "."])
             shed_exec(zone="documents", cmd="git", args=["log", "--oneline"])
             shed_exec(zone="group", group="team", cmd="ls", args=["-la"])
-            
+
             # Redirect output to file (like shell > redirection)
             shed_exec(zone="storage", cmd="jq", args=["-r", ".[]", "data.json"], stdout_file="output.txt")
-        
+
         Notes:
         - uploads: read-only commands only
         - documents/group: git commands allowed
-        - File paths in args are relative to zone root
+        - File paths in args are relative to zone root (don't include zone name!)
         - Use mkdir -p to create directories (NOT patch_text with .keep files!)
         - stdout_file/stderr_file: paths relative to zone root
         """
         try:
+            args = args or []  # Handle None default
             ctx = self._core._resolve_zone(zone, group, __user__, __metadata__)
-            
+
             # Validate command against zone whitelist
             self._core._validate_command(cmd, ctx.whitelist, args)
             
             # Validate arguments (path escapes, network, etc.)
             self._core._validate_args(args, ctx.readonly, cmd)
-            validated_args = self._core._validate_path_args(args, ctx.zone_root, cmd)
+            validated_args = self._core._validate_path_args(
+                args, ctx.zone_root, cmd,
+                zone_name=ctx.zone_name,
+                allow_zone_in_path=allow_zone_in_path
+            )
             
             # Validate and resolve output file paths
             stdout_path = None
@@ -4085,9 +4554,13 @@ class Tools:
                         "Use a writable zone (storage, documents)"
                     )
                 # Validate path doesn't escape
-                self._core._validate_path_args([stdout_file], ctx.zone_root, cmd)
+                self._core._validate_path_args(
+                    [stdout_file], ctx.zone_root, cmd,
+                    zone_name=ctx.zone_name,
+                    allow_zone_in_path=allow_zone_in_path
+                )
                 stdout_path = ctx.zone_root / stdout_file
-            
+
             if stderr_file:
                 if ctx.readonly:
                     raise StorageError(
@@ -4097,7 +4570,11 @@ class Tools:
                         "Use a writable zone (storage, documents)"
                     )
                 # Validate path doesn't escape
-                self._core._validate_path_args([stderr_file], ctx.zone_root, cmd)
+                self._core._validate_path_args(
+                    [stderr_file], ctx.zone_root, cmd,
+                    zone_name=ctx.zone_name,
+                    allow_zone_in_path=allow_zone_in_path
+                )
                 stderr_path = ctx.zone_root / stderr_file
             
             # Execute
@@ -4130,6 +4607,9 @@ class Tools:
                         repo_name = clone_target.rstrip("/").split("/")[-1]
                         if repo_name.endswith(".git"):
                             repo_name = repo_name[:-4]
+                        # Fallback if repo_name is empty (edge case: malformed URL)
+                        if not repo_name:
+                            repo_name = "repository"
                         clone_path = ctx.zone_root / repo_name
                     else:
                         clone_path = ctx.zone_root / clone_target
@@ -4160,8 +4640,82 @@ class Tools:
             
         except StorageError as e:
             return self._core._format_error(e, "shed_exec")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error during command execution")
+
+    async def shed_create_file(
+        self,
+        zone: str,
+        path: str,
+        content: str,
+        file_type: str = "text",
+        content_format: str = "hex",
+        group: str = None,
+        message: str = None,
+        mode: str = None,
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
+    ) -> str:
+        """
+        Create a new file or overwrite an existing file with the given content.
+
+        This is the simplest way to write a file. For appending or patching, use shed_patch_text/bytes.
+
+        :param zone: Target zone ("storage", "documents", or "group")
+        :param path: File path relative to zone (don't include zone name!)
+        :param content: File content (text string, or encoded binary if file_type="bytes")
+        :param file_type: "text" (default) or "bytes"
+        :param content_format: For bytes only: "hex" (default), "base64", or "raw"
+        :param group: Group name/ID (required if zone="group")
+        :param message: Git commit message (documents/group only)
+        :param mode: Ownership mode for new files in group: "owner", "group", "owner_ro"
+        :param allow_zone_in_path: Allow path starting with zone name (default: False)
+        :return: Creation result as JSON
+
+        Examples:
+            shed_create_file(zone="storage", path="hello.txt", content="Hello, world!")
+            shed_create_file(zone="documents", path="README.md", content="# My Project", message="Init")
+            shed_create_file(zone="storage", path="data.bin", content="48454C4C4F", file_type="bytes")
+            shed_create_file(zone="storage", path="img.png", content="iVBORw0K...", file_type="bytes", content_format="base64")
+        """
+        # Validate file_type
+        file_type_lower = file_type.lower() if isinstance(file_type, str) else ""
+        if file_type_lower not in ("text", "bytes"):
+            return self._core._format_response(
+                False,
+                error="INVALID_PARAMETER",
+                message=f"file_type must be 'text' or 'bytes', got: {repr(file_type)}",
+                hint="Use file_type='text' for text files or file_type='bytes' for binary"
+            )
+
+        # Delegate to appropriate patch function with overwrite=True
+        if file_type_lower == "bytes":
+            result = await self.shed_patch_bytes(
+                zone=zone, path=path, content=content,
+                content_format=content_format, overwrite=True,
+                group=group, message=message, mode=mode,
+                allow_zone_in_path=allow_zone_in_path,
+                __user__=__user__, __metadata__=__metadata__,
+            )
+        else:
+            result = await self.shed_patch_text(
+                zone=zone, path=path, content=content,
+                overwrite=True, group=group, message=message, mode=mode,
+                allow_zone_in_path=allow_zone_in_path,
+                __user__=__user__, __metadata__=__metadata__,
+            )
+
+        # Add hint explaining this is a wrapper function
+        try:
+            import json
+            parsed = json.loads(result)
+            if parsed.get("success"):
+                parsed["hint"] = "shed_create_file is a wrapper for shed_patch_text/bytes with overwrite=True. It exists because it's intuitive to find and use."
+                return json.dumps(parsed)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return result
 
     async def shed_patch_text(
         self,
@@ -4175,21 +4729,22 @@ class Tools:
         regex_flags: str = "",
         match_all: bool = False,
         overwrite: bool = False,
-        safe: bool = False,
+        safe: bool = True,
         group: str = None,
         message: str = None,
         mode: str = None,
-        __user__: dict = {},
-        __metadata__: dict = {},
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Edit a text file in the specified zone.
-        
+
         ⚠️ Use this ONLY for file CONTENT operations!
         For creating directories, use: shed_exec(zone, cmd="mkdir", args=["-p", "dir"])
-        
+
         :param zone: Target zone ("storage", "documents", or "group")
-        :param path: File path relative to zone
+        :param path: File path relative to zone (don't include zone name!)
         :param content: Content to write
         :param position: "start", "end", "before", "after", or "replace" (NOT "overwrite" or "at"!)
         :param line: Line number for "before"/"after"/"replace" (first line is 1, not 0)
@@ -4197,13 +4752,15 @@ class Tools:
         :param pattern: Regex pattern for "replace"
         :param regex_flags: Regex flags (i=ignore case, m=multiline, s=dotall)
         :param match_all: Replace all pattern matches (default: first only)
-        :param overwrite: Set to True to replace entire file (use this, NOT position="overwrite")
+        :param overwrite: True=replace entire file content, False=patch at position (default: False).
+                          Note: overwrite=False on existing file APPENDS/PATCHES, does NOT fail!
         :param safe: Lock file during edit
         :param group: Group name/ID (required if zone="group")
         :param message: Git commit message (documents/group only, ignored for storage)
         :param mode: Ownership mode for new files in group: "owner", "group", "owner_ro"
+        :param allow_zone_in_path: Allow path starting with zone name (default: False)
         :return: Edit result as JSON
-        
+
         Examples:
             shed_patch_text(zone="storage", path="notes.txt", content="New line\\n", position="end")
             shed_patch_text(zone="storage", path="file.txt", content="inserted\\n", position="before", line=5)
@@ -4217,12 +4774,13 @@ class Tools:
                 pattern=pattern, regex_flags=regex_flags, match_all=match_all,
                 overwrite=overwrite, safe=safe, group=group,
                 message=message, mode=mode,
+                allow_zone_in_path=allow_zone_in_path,
                 __user__=__user__, __metadata__=__metadata__,
             )
         except StorageError as e:
             return self._core._format_error(e, "shed_patch_text")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while editing text file")
 
     async def shed_patch_bytes(
         self,
@@ -4233,45 +4791,50 @@ class Tools:
         position: str = "end",
         offset: int = None,
         length: int = None,
-        safe: bool = False,
+        overwrite: bool = False,
+        safe: bool = True,
         group: str = None,
         message: str = None,
         mode: str = None,
-        __user__: dict = {},
-        __metadata__: dict = {},
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Edit a binary file in the specified zone.
-        
+
         :param zone: Target zone ("storage", "documents", or "group")
-        :param path: File path relative to zone
+        :param path: File path relative to zone (don't include zone name!)
         :param content: Content to write (format depends on content_format)
         :param content_format: "hex" (default), "base64", or "raw"
-        :param position: "start", "end", "at", or "replace"
+        :param position: "start", "end", "at", or "replace" (ignored if overwrite=True)
         :param offset: Byte offset for "at"/"replace"
         :param length: Bytes to replace for "replace"
+        :param overwrite: True=replace entire file, False=patch at position (default: False)
         :param safe: Lock file during edit
         :param group: Group name/ID (required if zone="group")
         :param message: Git commit message (documents/group only)
         :param mode: Ownership mode for new files in group
+        :param allow_zone_in_path: Allow path starting with zone name (default: False)
         :return: Edit result as JSON
-        
+
         Examples:
             shed_patch_bytes(zone="storage", path="data.bin", content="48454C4C4F")
-            shed_patch_bytes(zone="storage", path="img.png", content="89504E47", position="start")
+            shed_patch_bytes(zone="storage", path="img.png", content="89504E47", overwrite=True)
         """
         try:
             return await self._core._patch_bytes_impl(
                 zone=zone, path=path, content=content,
                 content_format=content_format, position=position,
-                offset=offset, length=length, safe=safe,
+                offset=offset, length=length, overwrite=overwrite, safe=safe,
                 group=group, message=message, mode=mode,
+                allow_zone_in_path=allow_zone_in_path,
                 __user__=__user__, __metadata__=__metadata__,
             )
         except StorageError as e:
             return self._core._format_error(e, "shed_patch_bytes")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while editing binary file")
 
     async def shed_delete(
         self,
@@ -4279,42 +4842,63 @@ class Tools:
         path: str,
         group: str = None,
         message: str = None,
-        __user__: dict = {},
-        __metadata__: dict = {},
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Delete a file or folder in the specified zone.
-        
+
         :param zone: Target zone ("uploads", "storage", "documents", or "group")
-        :param path: Path to delete (relative to zone)
+        :param path: Path to delete (relative to zone, don't include zone name!)
         :param group: Group name/ID (required if zone="group")
         :param message: Git commit message (documents/group only)
+        :param allow_zone_in_path: Allow path starting with zone name (default: False)
         :return: Deletion result as JSON
-        
+
         Examples:
             shed_delete(zone="uploads", path="temp.txt")
             shed_delete(zone="storage", path="old_project/")
             shed_delete(zone="documents", path="draft.md", message="Remove draft")
             shed_delete(zone="group", group="team", path="obsolete.txt", message="Cleanup")
-        
+
         Note: uploads allows delete to clean up imported files.
         """
         try:
+            if __user__ is None:
+                __user__ = {}
             # uploads allows delete even though readonly for other ops
             ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=False)
-            
-            path = self._core._validate_relative_path(path)
+
+            # Check for empty path first
+            if not path or path.strip() == "":
+                raise StorageError("MISSING_PARAMETER", "Path parameter is required")
+
+            path = self._core._validate_relative_path(path, ctx.zone_name, allow_zone_in_path)
             target = self._core._resolve_chroot_path(ctx.zone_root, path)
-            
+
+            # Prevent deleting the zone root itself
+            if target.resolve() == ctx.zone_root.resolve():
+                raise StorageError("INVALID_PATH", "Cannot delete zone root", hint="Specify a file or folder within the zone")
+
+            # Protect .git directory in versioned zones (documents, groups)
+            if path == ".git" or path.startswith(".git/"):
+                raise StorageError("PROTECTED_PATH", "Cannot delete .git directory", hint="The .git directory is required for version control")
+
             if not target.exists():
                 raise StorageError("FILE_NOT_FOUND", f"Path not found: {path}")
-            
+
+            # Check if file is locked by another conversation
+            # (skip for uploads which have no editzone_base, and for directories)
+            if ctx.editzone_base and not target.is_dir():
+                self._core._check_file_not_locked(ctx.editzone_base, path, ctx.conv_id)
+
             # Group: check delete permission
             user_id = __user__.get("id", "")
             if ctx.group_id:
                 can_delete, reason = self._core._can_delete_group_file(ctx.group_id, path, user_id)
                 if not can_delete:
-                    raise StorageError("PERMISSION_DENIED", reason, {"path": path})
+                    raise StorageError("PERMISSION_DENIED", reason)
             
             # Delete
             was_dir = target.is_dir()
@@ -4341,8 +4925,8 @@ class Tools:
             
         except StorageError as e:
             return self._core._format_error(e, "shed_delete")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while deleting file")
 
     async def shed_rename(
         self,
@@ -4351,36 +4935,51 @@ class Tools:
         new_path: str,
         group: str = None,
         message: str = None,
-        __user__: dict = {},
-        __metadata__: dict = {},
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Rename or move a file/folder within the specified zone.
-        
+
         :param zone: Target zone ("storage", "documents", or "group")
-        :param old_path: Current path (relative to zone)
-        :param new_path: New path (relative to zone)
+        :param old_path: Current path (relative to zone, don't include zone name!)
+        :param new_path: New path (relative to zone, don't include zone name!)
         :param group: Group name/ID (required if zone="group")
         :param message: Git commit message (documents/group only)
+        :param allow_zone_in_path: Allow paths starting with zone name (default: False)
         :return: Rename result as JSON
-        
+
         Examples:
             shed_rename(zone="storage", old_path="draft.txt", new_path="final.txt")
             shed_rename(zone="documents", old_path="old/", new_path="archive/", message="Reorganize")
             shed_rename(zone="group", group="team", old_path="v1.doc", new_path="v2.doc")
         """
         try:
+            if __user__ is None:
+                __user__ = {}
+
+            # Check for empty paths first
+            if not old_path or old_path.strip() == "":
+                raise StorageError("MISSING_PARAMETER", "old_path parameter is required")
+            if not new_path or new_path.strip() == "":
+                raise StorageError("MISSING_PARAMETER", "new_path parameter is required")
+
             ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=True)
-            
-            old_path = self._core._validate_relative_path(old_path)
-            new_path = self._core._validate_relative_path(new_path)
-            
+
+            old_path = self._core._validate_relative_path(old_path, ctx.zone_name, allow_zone_in_path)
+            new_path = self._core._validate_relative_path(new_path, ctx.zone_name, allow_zone_in_path)
+
             old_target = self._core._resolve_chroot_path(ctx.zone_root, old_path)
             new_target = self._core._resolve_chroot_path(ctx.zone_root, new_path)
-            
+
             if not old_target.exists():
                 raise StorageError("FILE_NOT_FOUND", f"Source not found: {old_path}")
-            
+
+            # Check if file is locked by another conversation (skip for directories)
+            if ctx.editzone_base and not old_target.is_dir():
+                self._core._check_file_not_locked(ctx.editzone_base, old_path, ctx.conv_id)
+
             if new_target.exists():
                 raise StorageError("FILE_EXISTS", f"Destination exists: {new_path}")
             
@@ -4389,7 +4988,7 @@ class Tools:
             if ctx.group_id:
                 can_write, reason = self._core._can_write_group_file(ctx.group_id, old_path, user_id)
                 if not can_write:
-                    raise StorageError("PERMISSION_DENIED", reason, {"path": old_path})
+                    raise StorageError("PERMISSION_DENIED", reason)
             
             # Create parent directories
             new_target.parent.mkdir(parents=True, exist_ok=True)
@@ -4415,41 +5014,54 @@ class Tools:
             
         except StorageError as e:
             return self._core._format_error(e, "shed_rename")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while renaming file")
 
     async def shed_lockedit_open(
         self,
         zone: str,
         path: str,
         group: str = None,
-        __user__: dict = {},
-        __metadata__: dict = {},
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Open a file for safe editing (locks file, creates working copy).
-        
+
         ⚠️ COMPLETE WORKFLOW (must follow all steps):
         1. shed_lockedit_open(zone, path)         → Lock file, get content
         2. shed_lockedit_overwrite(zone, path, content)  → Modify (NOT shed_patch_text!)
         3. shed_lockedit_save(zone, path)         → Save + unlock (CLOSES edit mode!)
-        
+
         OR to cancel: shed_lockedit_cancel(zone, path)  → Discard changes + unlock
-        
+
         :param zone: Target zone ("storage", "documents", or "group")
-        :param path: File path to edit
+        :param path: File path to edit (relative to zone, don't include zone name!)
         :param group: Group name/ID (required if zone="group")
+        :param allow_zone_in_path: Allow path starting with zone name (default: False)
         :return: File content and lock info as JSON
-        
+
         Examples:
             shed_lockedit_open(zone="storage", path="config.json")
             shed_lockedit_open(zone="documents", path="report.md")
             shed_lockedit_open(zone="group", group="team", path="shared.txt")
         """
         try:
+            if __user__ is None:
+                __user__ = {}
+
+            # Validate path parameter
+            if not path or not path.strip():
+                raise StorageError(
+                    "MISSING_PARAMETER",
+                    "File path is required",
+                    hint="Specify the file to edit: shed_lockedit_open(zone, path)"
+                )
+
             ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=True)
-            
-            path = self._core._validate_relative_path(path)
+
+            path = self._core._validate_relative_path(path, ctx.zone_name, allow_zone_in_path)
             target = self._core._resolve_chroot_path(ctx.zone_root, path)
             
             if not target.exists():
@@ -4463,76 +5075,100 @@ class Tools:
             if ctx.group_id:
                 can_write, reason = self._core._can_write_group_file(ctx.group_id, path, user_id)
                 if not can_write:
-                    raise StorageError("PERMISSION_DENIED", reason, {"path": path})
-            
+                    raise StorageError("PERMISSION_DENIED", reason)
+
             # Create lock
             lock_path = self._core._get_lock_path(ctx.editzone_base, path)
             self._core._acquire_lock(lock_path, ctx.conv_id, user_id, path)
-            
-            # Copy to editzone
-            editzone_path = self._core._get_editzone_path(ctx.editzone_base, ctx.conv_id, path)
-            editzone_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(target, editzone_path)
-            
-            # Read content
+
+            # All operations after lock acquisition must release lock on error
             try:
-                with open(editzone_path, 'r', encoding='utf-8', errors='replace') as f:
-                    content = f.read()
-                is_binary = False
-            except:
-                content = None
-                is_binary = True
-            
-            return self._core._format_response(True, data={
-                "zone": ctx.zone_name,
-                "path": path,
-                "content": content,
-                "is_binary": is_binary,
-                "size": target.stat().st_size,
-                "locked_by": user_id,
-            }, message=f"File opened for editing: {path}")
-            
+                # Copy to editzone
+                editzone_path = self._core._get_editzone_path(ctx.editzone_base, ctx.conv_id, path)
+                editzone_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(target, editzone_path)
+
+                # Read content
+                try:
+                    with open(editzone_path, 'r', encoding='utf-8', errors='replace') as f:
+                        content = f.read()
+                    is_binary = False
+                except (OSError, UnicodeDecodeError):
+                    content = None
+                    is_binary = True
+
+                return self._core._format_response(True, data={
+                    "zone": ctx.zone_name,
+                    "path": path,
+                    "content": content,
+                    "is_binary": is_binary,
+                    "size": target.stat().st_size,
+                    "locked_by": user_id,
+                }, message=f"File opened for editing: {path}")
+            except Exception:
+                # Clean up editzone and release lock on any failure after acquisition
+                try:
+                    if 'editzone_path' in dir() and editzone_path.exists():
+                        editzone_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                self._core._release_lock(lock_path)
+                raise
+
         except StorageError as e:
             return self._core._format_error(e, "shed_lockedit_open")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while acquiring file lock")
 
     async def shed_lockedit_exec(
         self,
         zone: str,
         path: str,
         cmd: str,
-        args: list = [],
+        args: list = None,
         timeout: int = None,
         group: str = None,
-        __user__: dict = {},
-        __metadata__: dict = {},
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Execute a command on file in editzone (working copy).
-        
+
         :param zone: Target zone ("storage", "documents", or "group")
-        :param path: File path (must be opened with shed_lockedit_open)
+        :param path: File path (must be opened with shed_lockedit_open, relative to zone)
         :param cmd: Command to execute
         :param args: Command arguments (use "." for the file being edited)
         :param timeout: Timeout in seconds
         :param group: Group name/ID (required if zone="group")
+        :param allow_zone_in_path: Allow path starting with zone name (default: False)
         :return: Command output as JSON
-        
+
         Examples:
             shed_lockedit_exec(zone="storage", path="data.txt", cmd="sed", args=["-i", "s/old/new/g", "."])
             shed_lockedit_exec(zone="storage", path="code.py", cmd="cat", args=["."])
         """
         try:
+            if __user__ is None:
+                __user__ = {}
+            args = args or []  # Handle None default
             ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=True)
-            
-            path = self._core._validate_relative_path(path)
+
+            # Validate path parameter
+            if not path or not path.strip():
+                raise StorageError(
+                    "MISSING_PARAMETER",
+                    "File path is required",
+                    hint="Specify the file: shed_lockedit_exec(zone, path, cmd)"
+                )
+
+            path = self._core._validate_relative_path(path, ctx.zone_name, allow_zone_in_path)
             user_id = __user__.get("id", "")
-            
+
             # Verify lock ownership
             lock_path = self._core._get_lock_path(ctx.editzone_base, path)
             self._core._check_lock_owner(lock_path, user_id)
-            
+
             # Get editzone path
             editzone_path = self._core._get_editzone_path(ctx.editzone_base, ctx.conv_id, path)
             
@@ -4564,8 +5200,8 @@ class Tools:
             
         except StorageError as e:
             return self._core._format_error(e, "shed_lockedit_exec")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error during locked file execution")
 
     async def shed_lockedit_overwrite(
         self,
@@ -4574,43 +5210,59 @@ class Tools:
         content: str,
         append: bool = False,
         group: str = None,
-        __user__: dict = {},
-        __metadata__: dict = {},
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Write content to file in editzone (working copy).
-        
+
         ⚠️ REQUIRES: File must be opened first with shed_lockedit_open()
         ⚠️ DO NOT use position, pattern, line, overwrite params - those are for shed_patch_text!
-        
+
         :param zone: Target zone ("storage", "documents", or "group")
-        :param path: File path (must be opened with shed_lockedit_open)
+        :param path: File path (must be opened with shed_lockedit_open, relative to zone)
         :param content: Content to write (replaces entire file by default)
         :param append: If True, append instead of replace
         :param group: Group name/ID (required if zone="group")
+        :param allow_zone_in_path: Allow path starting with zone name (default: False)
         :return: Write result as JSON
-        
+
         Examples:
             shed_lockedit_overwrite(zone="storage", path="config.json", content='{"key": "value"}')
             shed_lockedit_overwrite(zone="storage", path="log.txt", content="New entry\\n", append=True)
         """
         try:
+            if __user__ is None:
+                __user__ = {}
             ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=True)
-            
-            path = self._core._validate_relative_path(path)
+
+            # Validate path parameter
+            if not path or not path.strip():
+                raise StorageError(
+                    "MISSING_PARAMETER",
+                    "File path is required",
+                    hint="Specify the file: shed_lockedit_overwrite(zone, path, content)"
+                )
+
+            path = self._core._validate_relative_path(path, ctx.zone_name, allow_zone_in_path)
             user_id = __user__.get("id", "")
-            
+
             # Verify lock ownership
             lock_path = self._core._get_lock_path(ctx.editzone_base, path)
             self._core._check_lock_owner(lock_path, user_id)
-            
+
             # Get editzone path
             editzone_path = self._core._get_editzone_path(ctx.editzone_base, ctx.conv_id, path)
             
             if not editzone_path.exists():
                 raise StorageError("NOT_IN_EDIT_MODE", f"File not open for editing: {path}",
                                    hint="Use shed_lockedit_open() first. Note: shed_lockedit_save() CLOSES edit mode!")
-            
+
+            # Validate content parameter
+            if content is None:
+                raise StorageError("MISSING_PARAMETER", "Content parameter is required")
+
             # Check content size
             self._core._validate_content_size(content)
             
@@ -4631,8 +5283,8 @@ class Tools:
             
         except StorageError as e:
             return self._core._format_error(e, "shed_lockedit_overwrite")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while overwriting locked file")
 
     async def shed_lockedit_save(
         self,
@@ -4640,37 +5292,49 @@ class Tools:
         path: str,
         group: str = None,
         message: str = None,
-        __user__: dict = {},
-        __metadata__: dict = {},
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Save edited file back to zone and release lock.
-        
+
         ⚠️ THIS CLOSES EDIT MODE! After save, the file is unlocked.
         To edit again, you must call shed_lockedit_open() first.
-        
+
         Workflow: shed_lockedit_open → shed_lockedit_overwrite → shed_lockedit_save (done!)
-        
+
         :param zone: Target zone ("storage", "documents", or "group")
-        :param path: File path
+        :param path: File path (relative to zone, don't include zone name!)
         :param group: Group name/ID (required if zone="group")
         :param message: Git commit message (documents/group only)
+        :param allow_zone_in_path: Allow path starting with zone name (default: False)
         :return: Save result as JSON
-        
+
         Examples:
             shed_lockedit_save(zone="storage", path="config.json")
             shed_lockedit_save(zone="documents", path="report.md", message="Final version")
         """
         try:
+            if __user__ is None:
+                __user__ = {}
             ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=True)
-            
-            path = self._core._validate_relative_path(path)
+
+            # Validate path parameter
+            if not path or not path.strip():
+                raise StorageError(
+                    "MISSING_PARAMETER",
+                    "File path is required",
+                    hint="Specify the file to save: shed_lockedit_save(zone, path)"
+                )
+
+            path = self._core._validate_relative_path(path, ctx.zone_name, allow_zone_in_path)
             user_id = __user__.get("id", "")
-            
+
             # Verify lock ownership
             lock_path = self._core._get_lock_path(ctx.editzone_base, path)
             self._core._check_lock_owner(lock_path, user_id)
-            
+
             # Get paths
             editzone_path = self._core._get_editzone_path(ctx.editzone_base, ctx.conv_id, path)
             target = self._core._resolve_chroot_path(ctx.zone_root, path)
@@ -4687,20 +5351,24 @@ class Tools:
                 else:
                     self._core._check_quota(__user__, size_diff)
             
-            # Copy back to zone
+            # Copy back to zone - if this fails, keep lock for retry
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(editzone_path, target)
-            
-            # Git commit if needed
-            if ctx.git_commit:
-                self._core._git_run(["add", "-A"], ctx.zone_root)
-                commit_msg = message or f"Edit {path}"
-                self._core._git_commit_as_user(ctx.zone_root, commit_msg, user_id)
-            
-            # Cleanup
-            self._core._rm_with_empty_parents(editzone_path, ctx.editzone_base / "editzone")
-            lock_path.unlink(missing_ok=True)
-            
+
+            # Save succeeded - ensure lock is released even if git/cleanup fails
+            try:
+                # Git commit if needed
+                if ctx.git_commit:
+                    self._core._git_run(["add", "-A"], ctx.zone_root)
+                    commit_msg = message or f"Edit {path}"
+                    self._core._git_commit_as_user(ctx.zone_root, commit_msg, user_id)
+
+                # Cleanup editzone
+                self._core._rm_with_empty_parents(editzone_path, ctx.editzone_base / "editzone")
+            finally:
+                # Always release lock after successful save
+                self._core._release_lock(lock_path)
+
             return self._core._format_response(True, data={
                 "zone": ctx.zone_name,
                 "path": path,
@@ -4710,46 +5378,65 @@ class Tools:
             
         except StorageError as e:
             return self._core._format_error(e, "shed_lockedit_save")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while saving locked file")
 
     async def shed_lockedit_cancel(
         self,
         zone: str,
         path: str,
         group: str = None,
-        __user__: dict = {},
-        __metadata__: dict = {},
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Cancel editing and release lock (discards changes).
-        
+
         :param zone: Target zone ("storage", "documents", or "group")
-        :param path: File path
+        :param path: File path (relative to zone, don't include zone name!)
         :param group: Group name/ID (required if zone="group")
+        :param allow_zone_in_path: Allow path starting with zone name (default: False)
         :return: Cancel result as JSON
-        
+
         Examples:
             shed_lockedit_cancel(zone="storage", path="config.json")
         """
         try:
+            if __user__ is None:
+                __user__ = {}
             ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=True)
-            
-            path = self._core._validate_relative_path(path)
+
+            # Validate path parameter
+            if not path or not path.strip():
+                raise StorageError(
+                    "MISSING_PARAMETER",
+                    "File path is required",
+                    hint="Specify the file to cancel: shed_lockedit_cancel(zone, path)"
+                )
+
+            path = self._core._validate_relative_path(path, ctx.zone_name, allow_zone_in_path)
             user_id = __user__.get("id", "")
-            
+
             # Verify lock ownership
             lock_path = self._core._get_lock_path(ctx.editzone_base, path)
             self._core._check_lock_owner(lock_path, user_id)
-            
+
             # Get editzone path
             editzone_path = self._core._get_editzone_path(ctx.editzone_base, ctx.conv_id, path)
-            
-            # Cleanup
-            if editzone_path.exists():
-                self._core._rm_with_empty_parents(editzone_path, ctx.editzone_base / "editzone")
-            lock_path.unlink(missing_ok=True)
-            
+
+            # Verify file is in edit mode (must have lock or editzone file)
+            if not lock_path.exists() and not editzone_path.exists():
+                raise StorageError("NOT_IN_EDIT_MODE", f"File not open for editing: {path}",
+                                   hint="Use shed_lockedit_open() first")
+
+            # Cleanup - ensure lock is always released even if cleanup fails
+            try:
+                if editzone_path.exists():
+                    self._core._rm_with_empty_parents(editzone_path, ctx.editzone_base / "editzone")
+            finally:
+                self._core._release_lock(lock_path)
+
             return self._core._format_response(True, data={
                 "zone": ctx.zone_name,
                 "path": path,
@@ -4758,100 +5445,170 @@ class Tools:
             
         except StorageError as e:
             return self._core._format_error(e, "shed_lockedit_cancel")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while canceling file lock")
 
     async def shed_move_uploads_to_storage(
         self,
         src: str,
         dest: str,
-        __user__: dict = {},
-        __metadata__: dict = {},
+        overwrite: bool = False,
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Moves file from Uploads to Storage.
         IMPORTANT: Call shed_import() first to import uploaded files!
-        
-        :param src: Source path in Uploads
-        :param dest: Destination path in Storage
+
+        :param src: Source path in Uploads (don't include zone name!)
+        :param dest: Destination path in Storage (don't include zone name!)
+        :param overwrite: If True, overwrite existing destination file (default: False)
+        :param allow_zone_in_path: Allow paths starting with zone name (default: False)
         :return: Confirmation as JSON
         """
         try:
+            # Validate required parameters
+            if not src or not src.strip():
+                raise StorageError(
+                    "MISSING_PARAMETER",
+                    "Source path is required",
+                    hint="Specify the source file: shed_move_uploads_to_storage(src, dest)"
+                )
+            if not dest or not dest.strip():
+                raise StorageError(
+                    "MISSING_PARAMETER",
+                    "Destination path is required",
+                    hint="Specify the destination: shed_move_uploads_to_storage(src, dest)"
+                )
+
             user_root = self._core._get_user_root(__user__)
             conv_id = self._core._get_conv_id(__metadata__)
-            
+
+            # Validate paths with zone name check
+            src = self._core._validate_relative_path(src, "Uploads", allow_zone_in_path)
+            dest = self._core._validate_relative_path(dest, "Storage", allow_zone_in_path)
+
             src_chroot = user_root / "Uploads" / conv_id
             dest_chroot = user_root / "Storage" / "data"
-            
+
             source = self._core._resolve_chroot_path(src_chroot, src)
             target = self._core._resolve_chroot_path(dest_chroot, dest)
             
             if not source.exists():
                 raise StorageError(
-                    "FILE_NOT_FOUND", 
-                    f"File not found: {src}",
-                    {"path": src, "uploads_dir": str(src_chroot)},
-                    "Did you call shed_import(import_all=True) first? Files must be imported before moving."
+                    "FILE_NOT_FOUND",
+                    f"File not found in Uploads: {src}",
+                    {"path": src},
+                    "Did you call shed_import() first? Files must be imported before moving."
                 )
-            
+
+            if target.exists():
+                if overwrite:
+                    if target.is_dir():
+                        shutil.rmtree(str(target))
+                    else:
+                        target.unlink()
+                else:
+                    raise StorageError(
+                        "FILE_EXISTS",
+                        f"Destination exists: {dest}",
+                        hint="Use overwrite=True to replace the existing file"
+                    )
+
             # No quota check needed: move within user space doesn't change total usage
-            
+
             self._core._ensure_dir(dest_chroot)
             self._core._ensure_dir(target.parent)
-            
+
             shutil.move(str(source), str(target))
             
             return self._core._format_response(True, message=f"Moved: Uploads/{src} -> Storage/{dest}")
             
         except StorageError as e:
             return self._core._format_error(e, "shed_move_uploads_to_storage")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while moving file from Uploads to Storage")
     
     async def shed_move_uploads_to_documents(
         self,
         src: str,
         dest: str,
-        message: str = "",
-        __user__: dict = {},
-        __metadata__: dict = {},
+        message: str = None,
+        overwrite: bool = False,
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Moves file from Uploads to Documents with Git commit.
         IMPORTANT: Call shed_import() first to import uploaded files!
-        
-        :param src: Source path in Uploads
-        :param dest: Destination path in Documents
+
+        :param src: Source path in Uploads (don't include zone name!)
+        :param dest: Destination path in Documents (don't include zone name!)
         :param message: Commit message
+        :param overwrite: If True, overwrite existing destination file (default: False)
+        :param allow_zone_in_path: Allow paths starting with zone name (default: False)
         :return: Confirmation as JSON
         """
         try:
+            # Validate required parameters
+            if not src or not src.strip():
+                raise StorageError(
+                    "MISSING_PARAMETER",
+                    "Source path is required",
+                    hint="Specify the source file: shed_move_uploads_to_documents(src, dest)"
+                )
+            if not dest or not dest.strip():
+                raise StorageError(
+                    "MISSING_PARAMETER",
+                    "Destination path is required",
+                    hint="Specify the destination: shed_move_uploads_to_documents(src, dest)"
+                )
+
             user_root = self._core._get_user_root(__user__)
             conv_id = self._core._get_conv_id(__metadata__)
-            
+
+            # Validate paths with zone name check
+            src = self._core._validate_relative_path(src, "Uploads", allow_zone_in_path)
+            dest = self._core._validate_relative_path(dest, "Documents", allow_zone_in_path)
+
             src_chroot = user_root / "Uploads" / conv_id
             dest_chroot = user_root / "Documents" / "data"
-            
+
             source = self._core._resolve_chroot_path(src_chroot, src)
             target = self._core._resolve_chroot_path(dest_chroot, dest)
-            
+
             if not source.exists():
                 raise StorageError(
-                    "FILE_NOT_FOUND", 
-                    f"File not found: {src}",
-                    {"path": src, "uploads_dir": str(src_chroot)},
-                    "Did you call shed_import(import_all=True) first? Files must be imported before moving."
+                    "FILE_NOT_FOUND",
+                    f"File not found in Uploads: {src}",
+                    {"path": src},
+                    "Did you call shed_import() first? Files must be imported before moving."
                 )
-            
+
+            if target.exists():
+                if overwrite:
+                    if target.is_dir():
+                        shutil.rmtree(str(target))
+                    else:
+                        target.unlink()
+                else:
+                    raise StorageError(
+                        "FILE_EXISTS",
+                        f"Destination exists: {dest}",
+                        hint="Use overwrite=True to replace the existing file"
+                    )
+
             # No quota check needed: move within user space doesn't change total usage
-            
+
             # Init Git
             self._core._init_git_repo(dest_chroot)
-            
+
             self._core._ensure_dir(target.parent)
-            
+
             shutil.move(str(source), str(target))
-            
+
             # Commit
             if not message:
                 message = f"Import {src}"
@@ -4861,116 +5618,186 @@ class Tools:
             
         except StorageError as e:
             return self._core._format_error(e, "shed_move_uploads_to_documents")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while moving file from Uploads to Documents")
     
     async def shed_copy_storage_to_documents(
         self,
         src: str,
         dest: str,
-        message: str = "",
-        __user__: dict = {},
-        __metadata__: dict = {},
+        message: str = None,
+        overwrite: bool = False,
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Copies from Storage to Documents with Git commit.
-        
-        :param src: Source path
-        :param dest: Destination path
+
+        :param src: Source path in Storage (don't include zone name!)
+        :param dest: Destination path in Documents (don't include zone name!)
         :param message: Commit message
+        :param overwrite: If True, overwrite existing destination file (default: False)
+        :param allow_zone_in_path: Allow paths starting with zone name (default: False)
         :return: Confirmation as JSON
         """
         try:
+            # Validate required parameters
+            if not src or not src.strip():
+                raise StorageError(
+                    "MISSING_PARAMETER",
+                    "Source path is required",
+                    hint="Specify the source file: shed_copy_storage_to_documents(src, dest)"
+                )
+            if not dest or not dest.strip():
+                raise StorageError(
+                    "MISSING_PARAMETER",
+                    "Destination path is required",
+                    hint="Specify the destination: shed_copy_storage_to_documents(src, dest)"
+                )
+
             user_root = self._core._get_user_root(__user__)
-            
+
+            # Validate paths with zone name check
+            src = self._core._validate_relative_path(src, "Storage", allow_zone_in_path)
+            dest = self._core._validate_relative_path(dest, "Documents", allow_zone_in_path)
+
             src_chroot = user_root / "Storage" / "data"
             dest_chroot = user_root / "Documents" / "data"
-            
+
             source = self._core._resolve_chroot_path(src_chroot, src)
             target = self._core._resolve_chroot_path(dest_chroot, dest)
-            
+
             if not source.exists():
                 raise StorageError("FILE_NOT_FOUND", f"File not found: {src}")
-            
+
+            if target.exists():
+                if overwrite:
+                    if target.is_dir():
+                        shutil.rmtree(str(target))
+                    else:
+                        target.unlink()
+                else:
+                    raise StorageError(
+                        "FILE_EXISTS",
+                        f"Destination exists: {dest}",
+                        hint="Use overwrite=True to replace the existing file"
+                    )
+
             # Check quota before copy
             self._core._check_quota(__user__, self._core._get_path_size(source))
-            
+
             # Init Git
             self._core._init_git_repo(dest_chroot)
-            
+
             self._core._ensure_dir(target.parent)
-            
+
             if source.is_dir():
                 shutil.copytree(source, target)
             else:
                 shutil.copy2(source, target)
-            
+
             # Commit
             if not message:
                 message = f"Import from Storage: {src}"
             self._core._git_commit(dest_chroot, message)
-            
+
             return self._core._format_response(True, message=f"Copied and committed: Storage/{src} -> Documents/{dest}")
             
         except StorageError as e:
             return self._core._format_error(e, "shed_copy_storage_to_documents")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while copying file from Storage to Documents")
     
     async def shed_move_documents_to_storage(
         self,
         src: str,
         dest: str,
-        message: str = "",
-        __user__: dict = {},
-        __metadata__: dict = {},
+        message: str = None,
+        overwrite: bool = False,
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Moves from Documents to Storage with git rm + commit.
-        
-        :param src: Source path
-        :param dest: Destination path
+
+        :param src: Source path in Documents (don't include zone name!)
+        :param dest: Destination path in Storage (don't include zone name!)
         :param message: Commit message
+        :param overwrite: If True, overwrite existing destination file (default: False)
+        :param allow_zone_in_path: Allow paths starting with zone name (default: False)
         :return: Confirmation as JSON
         """
         try:
+            # Validate required parameters
+            if not src or not src.strip():
+                raise StorageError(
+                    "MISSING_PARAMETER",
+                    "Source path is required",
+                    hint="Specify the source file: shed_move_documents_to_storage(src, dest)"
+                )
+            if not dest or not dest.strip():
+                raise StorageError(
+                    "MISSING_PARAMETER",
+                    "Destination path is required",
+                    hint="Specify the destination: shed_move_documents_to_storage(src, dest)"
+                )
+
             user_root = self._core._get_user_root(__user__)
-            
+
+            # Validate paths with zone name check
+            src = self._core._validate_relative_path(src, "Documents", allow_zone_in_path)
+            dest = self._core._validate_relative_path(dest, "Storage", allow_zone_in_path)
+
             src_chroot = user_root / "Documents" / "data"
             dest_chroot = user_root / "Storage" / "data"
-            
+
             source = self._core._resolve_chroot_path(src_chroot, src)
             target = self._core._resolve_chroot_path(dest_chroot, dest)
-            
+
             if not source.exists():
                 raise StorageError("FILE_NOT_FOUND", f"File not found: {src}")
-            
+
+            if target.exists():
+                if overwrite:
+                    if target.is_dir():
+                        shutil.rmtree(str(target))
+                    else:
+                        target.unlink()
+                else:
+                    raise StorageError(
+                        "FILE_EXISTS",
+                        f"Destination exists: {dest}",
+                        hint="Use overwrite=True to replace the existing file"
+                    )
+
             # Check quota (move requires temporary duplication)
             self._core._check_quota(__user__, self._core._get_path_size(source))
-            
+
             self._core._ensure_dir(dest_chroot)
             self._core._ensure_dir(target.parent)
-            
+
             # Copy to Storage
             if source.is_dir():
                 shutil.copytree(source, target)
             else:
                 shutil.copy2(source, target)
-            
+
             # git rm in Documents via Layer 2
             self._core._git_run(["rm", "-rf", src], src_chroot)
-            
+
             # Commit
             if not message:
                 message = f"Move to Storage: {src}"
             self._core._git_commit(src_chroot, message)
-            
+
             return self._core._format_response(True, message=f"Moved: Documents/{src} -> Storage/{dest}")
             
         except StorageError as e:
             return self._core._format_error(e, "shed_move_documents_to_storage")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while moving file from Documents to Storage")
     
     # =========================================================================
     # UTILITIES (5 functions)
@@ -4981,8 +5808,9 @@ class Tools:
         filename: str = "",
         import_all: bool = False,
         dest_subdir: str = "",
-        __user__: dict = {},
-        __metadata__: dict = {},
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
         __files__: list = None,
         __event_emitter__=None,
     ) -> str:
@@ -5001,13 +5829,17 @@ class Tools:
           shed_import(filename="report.pdf")     -> import only report.pdf
         """
         try:
+            if __user__ is None:
+                __user__ = {}
+            if __metadata__ is None:
+                __metadata__ = {}
             user_root = self._core._get_user_root(__user__)
             conv_id = self._core._get_conv_id(__metadata__)
             uploads_dir = user_root / "Uploads" / conv_id
-            
+
             if dest_subdir:
                 # Validate dest_subdir
-                dest_subdir = self._core._validate_relative_path(dest_subdir)
+                dest_subdir = self._core._validate_relative_path(dest_subdir, "Uploads", allow_zone_in_path)
                 if dest_subdir:
                     uploads_dir = uploads_dir / dest_subdir
             
@@ -5076,20 +5908,20 @@ class Tools:
                                         file_path = str(candidate)
                                         break
                                 
-                                # Essayer: /base/file_id
+                                # Try: /base/file_id
                                 candidate = base_path / file_id
                                 if candidate.exists():
                                     file_path = str(candidate)
                                     break
-                                
-                                # Essayer: /base/user_id/file_id
+
+                                # Try: /base/user_id/file_id
                                 if user_id_from_file:
                                     candidate = base_path / user_id_from_file / file_id
                                     if candidate.exists():
                                         file_path = str(candidate)
                                         break
-                                
-                                # Chercher par pattern {id}_*
+
+                                # Search by pattern {id}_*
                                 for f in base_path.glob(f"{file_id}_*"):
                                     file_path = str(f)
                                     if not file_name:
@@ -5103,12 +5935,14 @@ class Tools:
                         file_name = Path(file_info).name
                     
                     if not file_name:
-                        file_name = file_id or "unknown"
-                    
+                        # Generate unique name to prevent collisions
+                        file_name = file_id or f"unknown_{uuid.uuid4().hex[:8]}"
+
                     # Security: clean filename (prevent traversal)
                     file_name = Path(file_name).name  # Keep only the name, not the path
                     if not file_name or file_name in (".", ".."):
-                        file_name = file_id or "unknown"
+                        # Generate unique name to prevent collisions
+                        file_name = file_id or f"unknown_{uuid.uuid4().hex[:8]}"
                     
                     # Filter if filename specified
                     if filename and file_name != filename:
@@ -5153,8 +5987,8 @@ class Tools:
                     else:
                         errors.append(f"{file_name}: source file not found")
                 
-                except Exception as e:
-                    errors.append(f"Error: {str(e)}")
+                except Exception:
+                    errors.append("An error occurred during import")
             
             if not imported:
                 return self._core._format_response(
@@ -5172,9 +6006,9 @@ class Tools:
                 data=result_data,
                 message=f"Imported {len(imported)} file(s) to Uploads. Use shed_delete(zone='uploads', path='...') to remove."
             )
-            
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error during file import")
     
     # =========================================================================
     # BUILTIN ZIP/UNZIP (Python zipfile - no external dependency)
@@ -5186,8 +6020,9 @@ class Tools:
         src: str,
         dest: str = "",
         src_zone: str = "",
-        __user__: dict = {},
-        __metadata__: dict = {},
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Extracts a ZIP archive using Python zipfile (builtin, no external dependency).
@@ -5248,10 +6083,18 @@ class Tools:
             else:
                 src_zone_root = user_root / "Documents" / "data"
 
+            # Validate source is not empty
+            if not src or not src.strip():
+                raise StorageError(
+                    "MISSING_PARAMETER",
+                    "Source path is required",
+                    hint="Specify the ZIP file to extract: shed_unzip(zone, src, dest)"
+                )
+
             # Validate and resolve paths
-            src = self._core._validate_relative_path(src)
+            src = self._core._validate_relative_path(src, src_zone_name, allow_zone_in_path)
             src_path = self._core._resolve_chroot_path(src_zone_root, src)
-            
+
             if not src_path.exists():
                 raise StorageError("FILE_NOT_FOUND", f"ZIP file not found: {src}")
             
@@ -5262,13 +6105,29 @@ class Tools:
                     {"file": src},
                     "Only .zip files are supported"
                 )
-            
+
+            # Verify ZIP magic bytes (not just extension)
+            with open(src_path, 'rb') as f:
+                header = f.read(4)
+            if not any(header.startswith(magic) for magic in ZIP_MAGIC_BYTES):
+                raise StorageError(
+                    "INVALID_FORMAT",
+                    "File has .zip extension but is not a valid ZIP archive",
+                    {"file": src},
+                    "The file header does not match ZIP format"
+                )
+
             # Determine destination
             if dest:
-                dest = self._core._validate_relative_path(dest)
+                dest = self._core._validate_relative_path(dest, zone_name, allow_zone_in_path)
                 dest_path = self._core._resolve_chroot_path(zone_root, dest)
             else:
-                dest_path = src_path.parent
+                # When dest is empty, extract to same relative location in destination zone
+                # (not src_path.parent which would be in the source zone for cross-zone ops)
+                src_relative = str(src_path.parent.relative_to(src_zone_root))
+                # Validate and resolve the path to prevent any escape
+                src_relative = self._core._validate_relative_path(src_relative, zone_name, allow_zone_in_path=True)
+                dest_path = self._core._resolve_chroot_path(zone_root, src_relative)
             
             # Check quota before extraction (estimate: 3x zip size)
             zip_size = src_path.stat().st_size
@@ -5304,9 +6163,69 @@ class Tools:
                             "ZIP file may be malicious (escapes destination directory)"
                         )
 
+                # ZIP bomb protection: check decompressed size and file count
+                infolist = zf.infolist()
+                total_size = sum(info.file_size for info in infolist)
+                file_count = len(infolist)
+
+                if file_count > ZIP_MAX_FILES:
+                    raise StorageError(
+                        "ZIP_BOMB",
+                        f"ZIP contains too many files ({file_count})",
+                        {"file_count": file_count, "max": ZIP_MAX_FILES},
+                        "ZIP file may be a decompression bomb"
+                    )
+
+                if total_size > ZIP_MAX_DECOMPRESSED_SIZE:
+                    raise StorageError(
+                        "ZIP_BOMB",
+                        f"ZIP decompressed size too large ({total_size // BYTES_PER_MB} MB)",
+                        {"decompressed_size": total_size, "max": ZIP_MAX_DECOMPRESSED_SIZE},
+                        "ZIP file may be a decompression bomb"
+                    )
+
+                if zip_size > 0 and total_size / zip_size > ZIP_MAX_COMPRESSION_RATIO:
+                    raise StorageError(
+                        "ZIP_BOMB",
+                        f"ZIP compression ratio too high ({total_size // zip_size}:1)",
+                        {"ratio": total_size / zip_size, "max_ratio": ZIP_MAX_COMPRESSION_RATIO},
+                        "ZIP file may be a decompression bomb"
+                    )
+
+                # Final symlink check before extraction (TOCTOU protection)
+                if dest_path.is_symlink():
+                    raise StorageError(
+                        "PATH_ESCAPE",
+                        "Destination is a symlink",
+                        {"dest": str(dest_path)},
+                        "Cannot extract to a symlink target"
+                    )
+
                 # Extract all files (safe after validation)
-                zf.extractall(dest_path)
-                extracted_files = zf.namelist()
+                members = zf.namelist()
+                try:
+                    zf.extractall(dest_path)
+                    extracted_files = members
+                except Exception:
+                    # Clean up any partially extracted files and directories on error
+                    # First remove files, then directories (in reverse order for nested dirs)
+                    # Remove files first
+                    for member in members:
+                        member_path = dest_path / member
+                        try:
+                            if member_path.is_file():
+                                member_path.unlink()
+                        except OSError:
+                            pass
+                    # Remove empty directories (reverse sorted for nested cleanup)
+                    for member in sorted(members, reverse=True):
+                        member_path = dest_path / member
+                        try:
+                            if member_path.is_dir() and not any(member_path.iterdir()):
+                                member_path.rmdir()
+                        except OSError:
+                            pass
+                    raise
             
             # Git commit if Documents
             if zone_lower == "documents":
@@ -5336,8 +6255,8 @@ class Tools:
             return self._core._format_error(e, "shed_unzip")
         except zipfile.BadZipFile:
             return self._core._format_response(False, message="Invalid or corrupted ZIP file")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error during ZIP extraction")
     
     async def shed_zip(
         self,
@@ -5345,8 +6264,9 @@ class Tools:
         src: str,
         dest: str = "",
         include_empty_dirs: bool = False,
-        __user__: dict = {},
-        __metadata__: dict = {},
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Creates a ZIP archive using Python zipfile (builtin, no external dependency).
@@ -5378,25 +6298,39 @@ class Tools:
             # Get zone path
             if zone_lower == "storage":
                 zone_root = user_root / "Storage" / "data"
+                zone_name = "Storage"
             else:
                 zone_root = user_root / "Documents" / "data"
-            
+                zone_name = "Documents"
+
+            # Validate source is not empty
+            if not src or not src.strip():
+                raise StorageError(
+                    "MISSING_PARAMETER",
+                    "Source path is required",
+                    hint="Specify the file or folder to compress: shed_zip(zone, src, dest)"
+                )
+
             # Validate and resolve source path
-            src = self._core._validate_relative_path(src)
+            src = self._core._validate_relative_path(src, zone_name, allow_zone_in_path)
             src_path = self._core._resolve_chroot_path(zone_root, src)
-            
+
             if not src_path.exists():
                 raise StorageError("FILE_NOT_FOUND", f"Source not found: {src}")
-            
+
             # Determine destination
             if dest:
-                dest = self._core._validate_relative_path(dest)
+                dest = self._core._validate_relative_path(dest, zone_name, allow_zone_in_path)
                 if not dest.endswith('.zip'):
                     dest += '.zip'
                 dest_path = self._core._resolve_chroot_path(zone_root, dest)
             else:
                 dest_path = src_path.parent / (src_path.name + ".zip")
-            
+
+            # Check if destination exists
+            if dest_path.exists():
+                raise StorageError("FILE_EXISTS", f"Destination exists: {dest or dest_path.name}")
+
             # Check quota (estimate: same size as source)
             src_size = self._core._get_path_size(src_path)
             self._core._check_quota(__user__, src_size)
@@ -5455,8 +6389,8 @@ class Tools:
             
         except StorageError as e:
             return self._core._format_error(e, "shed_zip")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error during ZIP creation")
 
     # =========================================================================
     # BUILTIN UTILITIES - Replace missing system commands (5 functions)
@@ -5468,8 +6402,9 @@ class Tools:
         path: str = ".",
         depth: int = 3,
         group: str = None,
-        __user__: dict = {},
-        __metadata__: dict = {},
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Displays directory tree structure (replaces missing 'tree' command).
@@ -5485,46 +6420,29 @@ class Tools:
             shed_tree(zone="group", group="MyTeam", path="docs")
         """
         try:
-            user_root = self._core._get_user_root(__user__)
-            conv_id = self._core._get_conv_id(__metadata__)
-            zone_lower = zone.lower()
-            
-            # Validate zone
-            if zone_lower == "uploads":
-                zone_root = user_root / "Uploads" / conv_id
-            elif zone_lower == "storage":
-                zone_root = user_root / "Storage" / "data"
-            elif zone_lower == "documents":
-                zone_root = user_root / "Documents" / "data"
-            elif zone_lower == "group":
-                if not group:
-                    raise StorageError(
-                        "MISSING_PARAMETER",
-                        "Group name is required for zone='group'",
-                        hint="Use: shed_tree(zone='group', group='GroupName', path='...')"
-                    )
-                # Resolve group and check membership
-                group_id = self._core._validate_group_id(group)
-                self._core._check_group_access(__user__, group_id)
-                zone_root = self._core._get_group_data_path(group_id)
-            else:
-                raise StorageError(
-                    "ZONE_FORBIDDEN",
-                    f"Invalid zone: {zone}",
-                    hint="Use 'uploads', 'storage', 'documents', or 'group'"
-                )
-            
+            # Resolve zone using standard helper
+            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=False)
+            zone_root = ctx.zone_root
+            zone_name = ctx.zone_name
+
             if not zone_root.exists():
                 return self._core._format_response(True, data={"tree": "(empty)"}, message="Zone is empty")
-            
+
             # Validate and resolve path
-            path = self._core._validate_relative_path(path) if path and path != "." else ""
+            path = self._core._validate_relative_path(path, zone_name, allow_zone_in_path) if path and path != "." else ""
             start_path = self._core._resolve_chroot_path(zone_root, path) if path else zone_root
             
             if not start_path.exists():
                 raise StorageError("FILE_NOT_FOUND", f"Path not found: {path}")
-            
-            # Clamp depth
+
+            # Validate and clamp depth
+            if depth < 0:
+                raise StorageError(
+                    "INVALID_PARAMETER",
+                    "Depth must be non-negative",
+                    {"depth": depth},
+                    "Use depth between 0 and 10"
+                )
             depth = max(1, min(depth, 10))
             
             # Build tree
@@ -5541,9 +6459,11 @@ class Tools:
                 # Filter out hidden files and limit items
                 items = [i for i in items if not i.name.startswith('.')]
                 total = len(items)
-                
-                for idx, item in enumerate(items[:100]):  # Limit to 100 items per dir
-                    is_last = (idx == len(items[:100]) - 1) or (idx == 99 and total > 100)
+                items_limited = items[:100]  # Limit to 100 items per dir
+                items_limited_count = len(items_limited)
+
+                for idx, item in enumerate(items_limited):
+                    is_last = (idx == items_limited_count - 1) or (idx == 99 and total > 100)
                     connector = "└── " if is_last else "├── "
                     
                     if item.is_dir():
@@ -5554,7 +6474,7 @@ class Tools:
                     else:
                         try:
                             size = item.stat().st_size
-                            size_str = f"{size / 1024 / 1024:.1f}M" if size > 1024*1024 else f"{size / 1024:.1f}K" if size > 1024 else f"{size}B"
+                            size_str = self._core._format_size(size, short=True)
                         except (OSError, FileNotFoundError):
                             size_str = "?"
                         lines.append(f"{prefix}{connector}{item.name} ({size_str})")
@@ -5565,12 +6485,12 @@ class Tools:
                 return lines
             
             # Generate tree
-            root_name = start_path.name if path else (group if zone_lower == "group" else zone_lower.capitalize())
+            root_name = start_path.name if path else (group if ctx.zone_lower == "group" else ctx.zone_lower.capitalize())
             tree_lines = [f"{root_name}/"]
             tree_lines.extend(build_tree(start_path))
             tree_output = "\n".join(tree_lines)
-            
-            zone_display = f"Group:{group}" if zone_lower == "group" else zone_lower.capitalize()
+
+            zone_display = zone_name
             return self._core._format_response(
                 True,
                 data={"tree": tree_output, "depth": depth, "path": path or ".", "zone": zone_display},
@@ -5579,47 +6499,46 @@ class Tools:
             
         except StorageError as e:
             return self._core._format_error(e, "shed_tree")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while building directory tree")
     
     async def shed_zipinfo(
         self,
         zone: str,
         path: str,
-        __user__: dict = {},
-        __metadata__: dict = {},
+        group: str = None,
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Shows ZIP archive contents and metadata (replaces missing 'zipinfo' command).
-        
-        :param zone: Target zone ("uploads", "storage", or "documents")
+
+        :param zone: Target zone ("uploads", "storage", "documents", or "group")
         :param path: Path to ZIP file
+        :param group: Group name (required if zone="group")
         :return: ZIP contents and metadata as JSON
-        
+
         Example:
             shed_zipinfo(zone="storage", path="backup.zip")
+            shed_zipinfo(zone="group", group="MyTeam", path="archive.zip")
         """
         try:
-            user_root = self._core._get_user_root(__user__)
-            zone_lower = zone.lower()
-            
-            # Validate zone
-            if zone_lower == "storage":
-                zone_root = user_root / "Storage" / "data"
-            elif zone_lower == "documents":
-                zone_root = user_root / "Documents" / "data"
-            elif zone_lower == "uploads":
-                conv_id = self._core._get_conv_id(__metadata__)
-                zone_root = user_root / "Uploads" / conv_id
-            else:
+            # Resolve zone using standard helper
+            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=False)
+            zone_root = ctx.zone_root
+            zone_name = ctx.zone_name
+
+            # Validate path is not empty
+            if not path or not path.strip():
                 raise StorageError(
-                    "ZONE_FORBIDDEN",
-                    f"Invalid zone: {zone}",
-                    hint="Use 'uploads', 'storage', or 'documents'"
+                    "MISSING_PARAMETER",
+                    "Path is required",
+                    hint="Specify the ZIP file: shed_zipinfo(zone, path)"
                 )
-            
+
             # Validate and resolve path
-            path = self._core._validate_relative_path(path)
+            path = self._core._validate_relative_path(path, zone_name, allow_zone_in_path)
             zip_path = self._core._resolve_chroot_path(zone_root, path)
             
             if not zip_path.exists():
@@ -5631,7 +6550,18 @@ class Tools:
                     "File is not a ZIP archive",
                     hint="Only .zip files are supported"
                 )
-            
+
+            # Verify ZIP magic bytes (not just extension)
+            with open(zip_path, 'rb') as f:
+                header = f.read(4)
+            if not any(header.startswith(magic) for magic in ZIP_MAGIC_BYTES):
+                raise StorageError(
+                    "INVALID_FORMAT",
+                    "File has .zip extension but is not a valid ZIP archive",
+                    {"file": path},
+                    "The file header does not match ZIP format"
+                )
+
             # Read ZIP info
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 files = []
@@ -5660,7 +6590,7 @@ class Tools:
                         "path": path,
                         "files_count": len(files),
                         "total_size": total_size,
-                        "total_size_human": f"{total_size / 1024 / 1024:.2f} MB" if total_size > 1024*1024 else f"{total_size / 1024:.1f} KB",
+                        "total_size_human": self._core._format_size(total_size),
                         "compressed_size": total_compressed,
                         "compression_ratio": f"{ratio:.1f}%",
                         "files": files[:100],  # Limit to 100
@@ -5673,52 +6603,43 @@ class Tools:
             return self._core._format_error(e, "shed_zipinfo")
         except zipfile.BadZipFile:
             return self._core._format_response(False, message="Invalid or corrupted ZIP file")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while reading ZIP info")
     
     async def shed_file_type(
         self,
         zone: str,
         path: str,
-        __user__: dict = {},
-        __metadata__: dict = {},
+        group: str = None,
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Identifies file MIME type (replaces missing 'file' command).
-        
-        :param zone: Target zone ("uploads", "storage", or "documents")
+
+        :param zone: Target zone ("uploads", "storage", "documents", or "group")
         :param path: Path to file
+        :param group: Group name (required if zone="group")
         :return: File type information as JSON
-        
+
         Example:
             shed_file_type(zone="storage", path="document.pdf")
+            shed_file_type(zone="group", group="MyTeam", path="data.csv")
         """
         try:
-            user_root = self._core._get_user_root(__user__)
-            conv_id = self._core._get_conv_id(__metadata__)
-            zone_lower = zone.lower()
-            
-            # Validate zone
-            if zone_lower == "uploads":
-                zone_root = user_root / "Uploads" / conv_id
-            elif zone_lower == "storage":
-                zone_root = user_root / "Storage" / "data"
-            elif zone_lower == "documents":
-                zone_root = user_root / "Documents" / "data"
-            else:
-                raise StorageError(
-                    "ZONE_FORBIDDEN",
-                    f"Invalid zone: {zone}",
-                    hint="Use 'uploads', 'storage', or 'documents'"
-                )
-            
+            # Resolve zone using standard helper
+            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=False)
+            zone_root = ctx.zone_root
+            zone_name = ctx.zone_name
+
             # Validate and resolve path
-            path = self._core._validate_relative_path(path)
+            path = self._core._validate_relative_path(path, zone_name, allow_zone_in_path)
             file_path = self._core._resolve_chroot_path(zone_root, path)
-            
+
             if not file_path.exists():
                 raise StorageError("FILE_NOT_FOUND", f"File not found: {path}")
-            
+
             if file_path.is_dir():
                 return self._core._format_response(
                     True,
@@ -5796,45 +6717,46 @@ class Tools:
             
         except StorageError as e:
             return self._core._format_error(e, "shed_file_type")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while detecting file type")
     
     async def shed_convert_eol(
         self,
         zone: str,
         path: str,
         to: str = "unix",
-        __user__: dict = {},
-        __metadata__: dict = {},
+        group: str = None,
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Converts line endings (replaces missing 'dos2unix'/'unix2dos' commands).
-        
-        :param zone: Target zone ("storage" or "documents")
+
+        :param zone: Target zone ("storage", "documents", or "group")
         :param path: Path to text file
         :param to: Target format: "unix" (LF) or "dos" (CRLF)
+        :param group: Group name (required if zone="group")
         :return: Conversion result as JSON
-        
+
         Example:
             shed_convert_eol(zone="storage", path="script.sh", to="unix")
-            shed_convert_eol(zone="storage", path="readme.txt", to="dos")
+            shed_convert_eol(zone="group", group="MyTeam", path="readme.txt", to="dos")
         """
         try:
-            user_root = self._core._get_user_root(__user__)
-            zone_lower = zone.lower()
-            
-            # Validate zone (not uploads - read-only)
-            if zone_lower == "storage":
-                zone_root = user_root / "Storage" / "data"
-            elif zone_lower == "documents":
-                zone_root = user_root / "Documents" / "data"
-            else:
+            # Resolve zone using standard helper (require_write=True rejects uploads)
+            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=True)
+            zone_root = ctx.zone_root
+            zone_name = ctx.zone_name
+
+            # LLM Guardrail: validate type before use
+            if not isinstance(to, str):
                 raise StorageError(
-                    "ZONE_FORBIDDEN",
-                    f"Invalid zone for writing: {zone}",
-                    hint="Use 'storage' or 'documents'"
+                    "INVALID_PARAMETER",
+                    f"to must be a string ('unix' or 'dos'), got: {repr(to)} ({type(to).__name__})",
+                    hint="Use to='unix' for LF line endings or to='dos' for CRLF (Windows)"
                 )
-            
+
             # Validate target format
             to_lower = to.lower()
             if to_lower not in ("unix", "dos", "lf", "crlf"):
@@ -5843,12 +6765,12 @@ class Tools:
                     f"Invalid EOL format: {to}",
                     hint="Use 'unix' (LF) or 'dos' (CRLF)"
                 )
-            
+
             # Normalize format name
             to_unix = to_lower in ("unix", "lf")
-            
+
             # Validate and resolve path
-            path = self._core._validate_relative_path(path)
+            path = self._core._validate_relative_path(path, zone_name, allow_zone_in_path)
             file_path = self._core._resolve_chroot_path(zone_root, path)
             
             if not file_path.exists():
@@ -5860,8 +6782,8 @@ class Tools:
             # Read file
             try:
                 content = file_path.read_bytes()
-            except Exception as e:
-                raise StorageError("EXEC_ERROR", f"Cannot read file: {e}")
+            except Exception:
+                raise StorageError("EXEC_ERROR", "Cannot read file")
             
             # Count existing line endings
             crlf_count = content.count(b'\r\n')
@@ -5897,9 +6819,9 @@ class Tools:
             
             # Write back
             file_path.write_bytes(new_content)
-            
-            # Git commit if Documents
-            if zone_lower == "documents":
+
+            # Git commit if configured for this zone
+            if ctx.git_commit:
                 self._core._git_commit(zone_root, f"Convert EOL to {target_format}: {path}")
             
             return self._core._format_response(
@@ -5916,8 +6838,8 @@ class Tools:
             
         except StorageError as e:
             return self._core._format_error(e, "shed_convert_eol")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error during line ending conversion")
     
     async def shed_hexdump(
         self,
@@ -5925,53 +6847,62 @@ class Tools:
         path: str,
         offset: int = 0,
         length: int = 256,
-        __user__: dict = {},
-        __metadata__: dict = {},
+        group: str = None,
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Shows hexadecimal dump of file (replaces missing 'xxd'/'hexdump' commands).
-        
-        :param zone: Target zone ("uploads", "storage", or "documents")
+
+        :param zone: Target zone ("uploads", "storage", "documents", or "group")
         :param path: Path to file
         :param offset: Starting offset in bytes (default: 0)
         :param length: Number of bytes to display (default: 256, max: 4096)
+        :param group: Group name (required if zone="group")
         :return: Hex dump as text
-        
+
         Example:
             shed_hexdump(zone="storage", path="binary.dat", offset=0, length=128)
+            shed_hexdump(zone="group", group="MyTeam", path="data.bin")
         """
         try:
-            user_root = self._core._get_user_root(__user__)
-            conv_id = self._core._get_conv_id(__metadata__)
-            zone_lower = zone.lower()
-            
-            # Validate zone
-            if zone_lower == "uploads":
-                zone_root = user_root / "Uploads" / conv_id
-            elif zone_lower == "storage":
-                zone_root = user_root / "Storage" / "data"
-            elif zone_lower == "documents":
-                zone_root = user_root / "Documents" / "data"
-            else:
-                raise StorageError(
-                    "ZONE_FORBIDDEN",
-                    f"Invalid zone: {zone}",
-                    hint="Use 'uploads', 'storage', or 'documents'"
-                )
-            
+            # Resolve zone using standard helper
+            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=False)
+            zone_root = ctx.zone_root
+            zone_name = ctx.zone_name
+
             # Validate and resolve path
-            path = self._core._validate_relative_path(path)
+            path = self._core._validate_relative_path(path, zone_name, allow_zone_in_path)
             file_path = self._core._resolve_chroot_path(zone_root, path)
-            
+
             if not file_path.exists():
                 raise StorageError("FILE_NOT_FOUND", f"File not found: {path}")
-            
+
             if file_path.is_dir():
                 raise StorageError("INVALID_FORMAT", "Cannot hexdump directory")
-            
+
+            # LLM Guardrail: convert None to defaults, validate types
+            if offset is None:
+                offset = 0
+            elif not isinstance(offset, int):
+                raise StorageError(
+                    "INVALID_PARAMETER",
+                    f"offset must be an integer or None, got: {repr(offset)} ({type(offset).__name__})",
+                    hint="Use offset=0 for start of file, or omit for default"
+                )
+            if length is None:
+                length = DEFAULT_HEXDUMP_BYTES
+            elif not isinstance(length, int):
+                raise StorageError(
+                    "INVALID_PARAMETER",
+                    f"length must be an integer or None, got: {repr(length)} ({type(length).__name__})",
+                    hint="Use length=256 or omit for default"
+                )
+
             # Clamp values
             offset = max(0, offset)
-            length = max(1, min(length, 4096))
+            length = max(1, min(length, MAX_HEXDUMP_BYTES))
             
             # Read file portion
             file_size = file_path.stat().st_size
@@ -6031,8 +6962,8 @@ class Tools:
             
         except StorageError as e:
             return self._core._format_error(e, "shed_hexdump")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error during hexdump")
 
     async def shed_sqlite(
         self,
@@ -6053,8 +6984,9 @@ class Tools:
         skip_rows: int = 0,
         has_header: bool = True,
         group: str = None,
-        __user__: dict = {},
-        __metadata__: dict = {},
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Executes SQL query on a SQLite database file OR imports a CSV file.
@@ -6147,50 +7079,41 @@ class Tools:
               CSV import keeps data on disk - no context pollution!
         """
         try:
-            user_root = self._core._get_user_root(__user__)
-            conv_id = self._core._get_conv_id(__metadata__)
-            zone_lower = zone.lower()
-            
-            # Determine the zone root
-            if zone_lower == "uploads":
-                zone_root = user_root / "Uploads" / conv_id
-                readonly = True
-            elif zone_lower == "storage":
-                zone_root = user_root / "Storage" / "data"
-                readonly = False
-            elif zone_lower == "documents":
-                zone_root = user_root / "Documents" / "data"
-                readonly = False
-            elif zone_lower == "group":
-                if not group:
-                    raise StorageError(
-                        "MISSING_PARAMETER",
-                        "Group parameter required when zone='group'",
-                        hint="Add group='group_name' parameter"
-                    )
-                # Validate and resolve group
-                group = self._core._validate_group_id(group)
-                self._core._check_group_access(__user__, group)
-                zone_root = Path(self.valves.storage_base_path) / "groups" / group / "data"
-                readonly = False
-            else:
-                raise StorageError(
-                    "ZONE_FORBIDDEN",
-                    f"Invalid zone: {zone}",
-                    hint="Use 'uploads', 'storage', 'documents', or 'group'"
-                )
-            
+            # Use centralized zone resolution
+            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=False)
+            zone_root = ctx.zone_root
+            zone_name = ctx.zone_name
+            readonly = ctx.readonly
+
             # Validate and resolve path
-            path = self._core._validate_relative_path(path)
+            path = self._core._validate_relative_path(path, zone_name, allow_zone_in_path)
             db_path = self._core._resolve_chroot_path(zone_root, path)
             
             # Ensure parent directory exists
             db_path.parent.mkdir(parents=True, exist_ok=True)
-            
+
+            # Validate mutually exclusive parameters
+            if import_csv and query:
+                raise StorageError(
+                    "INVALID_PARAMETER",
+                    "Cannot use both 'import_csv' and 'query' parameters",
+                    hint="Use import_csv for CSV import OR query for SQL execution, not both"
+                )
+
             # =====================================================
             # CSV IMPORT MODE
             # =====================================================
             if import_csv:
+                # LLM Guardrail: convert skip_rows=None to 0
+                if skip_rows is None:
+                    skip_rows = 0
+                elif not isinstance(skip_rows, int):
+                    raise StorageError(
+                        "INVALID_PARAMETER",
+                        f"skip_rows must be an integer, got: {repr(skip_rows)} ({type(skip_rows).__name__})",
+                        hint="Use skip_rows=0 (default) or skip_rows=2 to skip 2 rows"
+                    )
+
                 # Validate parameters
                 if not table:
                     raise StorageError(
@@ -6198,7 +7121,7 @@ class Tools:
                         "table parameter required for CSV import",
                         hint="Add table='tablename' parameter"
                     )
-                
+
                 if if_exists not in ("fail", "replace", "append"):
                     raise StorageError(
                         "INVALID_PARAMETER",
@@ -6224,7 +7147,7 @@ class Tools:
                     )
                 
                 # Resolve CSV path (in same zone)
-                import_csv_path = self._core._validate_relative_path(import_csv)
+                import_csv_path = self._core._validate_relative_path(import_csv, zone_name, allow_zone_in_path)
                 csv_path = self._core._resolve_chroot_path(zone_root, import_csv_path)
                 
                 if not csv_path.exists():
@@ -6253,14 +7176,13 @@ class Tools:
                     
                     if table_exists:
                         if if_exists == "fail":
-                            conn.close()
                             raise StorageError(
                                 "TABLE_EXISTS",
                                 f"Table '{table}' already exists",
                                 hint="Use if_exists='replace' or if_exists='append'"
                             )
                         elif if_exists == "replace":
-                            cursor.execute(f"DROP TABLE IF EXISTS {table}")
+                            cursor.execute(f'DROP TABLE IF EXISTS "{table}"')
                             table_exists = False
                     
                     import_info = {"method": "unknown"}
@@ -6328,12 +7250,11 @@ class Tools:
                         # Read CSV
                         try:
                             df = pd.read_csv(str(csv_path), **pd_kwargs)
-                        except Exception as e:
-                            conn.close()
+                        except Exception:
                             raise StorageError(
                                 "CSV_PARSE_ERROR",
-                                f"Failed to parse CSV with pandas: {str(e)}",
-                                {"csv": import_csv, "pandas_args": {k: str(v) for k, v in pd_kwargs.items()}},
+                                "Failed to parse CSV with pandas",
+                                {"csv": import_csv},
                                 hint="Try specifying delimiter, encoding, or skip_rows explicitly"
                             )
                         
@@ -6363,7 +7284,16 @@ class Tools:
                                     clean = '_' + clean
                                 clean_columns.append(clean)
                             df.columns = clean_columns
-                        
+
+                        # Check column count limit (DoS protection)
+                        if len(df.columns) > CSV_MAX_COLUMNS:
+                            raise StorageError(
+                                "CSV_TOO_WIDE",
+                                f"CSV has too many columns ({len(df.columns)})",
+                                {"columns": len(df.columns), "max": CSV_MAX_COLUMNS},
+                                f"Maximum {CSV_MAX_COLUMNS} columns allowed"
+                            )
+
                         # Import to SQLite
                         pandas_if_exists = 'append' if if_exists == 'append' and table_exists else 'replace'
                         df.to_sql(table, conn, if_exists=pandas_if_exists, index=False)
@@ -6430,7 +7360,6 @@ class Tools:
                                 # No header: first row is data, generate column names
                                 first_data_row = next(reader, None)
                                 if first_data_row is None:
-                                    conn.close()
                                     raise StorageError(
                                         "CSV_EMPTY",
                                         "CSV file is empty (no data rows)",
@@ -6438,15 +7367,24 @@ class Tools:
                                     )
                                 clean_headers = [f"col_{i+1}" for i in range(len(first_data_row))]
                                 import_info['generated_columns'] = True
-                            
+
+                            # Check column count limit (DoS protection)
+                            if len(clean_headers) > CSV_MAX_COLUMNS:
+                                raise StorageError(
+                                    "CSV_TOO_WIDE",
+                                    f"CSV has too many columns ({len(clean_headers)})",
+                                    {"columns": len(clean_headers), "max": CSV_MAX_COLUMNS},
+                                    f"Maximum {CSV_MAX_COLUMNS} columns allowed"
+                                )
+
                             # Create table if needed
                             if not table_exists or if_exists == "replace":
-                                columns_def = ", ".join(f"{col} TEXT" for col in clean_headers)
-                                cursor.execute(f"CREATE TABLE {table} ({columns_def})")
-                            
+                                columns_def = ", ".join(f'"{col}" TEXT' for col in clean_headers)
+                                cursor.execute(f'CREATE TABLE "{table}" ({columns_def})')
+
                             # Prepare INSERT statement
                             placeholders = ", ".join("?" * len(clean_headers))
-                            insert_sql = f"INSERT INTO {table} VALUES ({placeholders})"
+                            insert_sql = f'INSERT INTO "{table}" VALUES ({placeholders})'
                             
                             # Date parsing setup
                             date_col_indices = []
@@ -6545,8 +7483,7 @@ class Tools:
                                 total_rows += len(batch)
                     
                     conn.commit()
-                    conn.close()
-                    
+
                     response_data = {
                         "db_path": path,
                         "csv_path": import_csv,
@@ -6573,22 +7510,25 @@ class Tools:
                     )
                     
                 except StorageError:
+                    conn.rollback()  # Explicit rollback on error
                     raise
-                except sqlite3.Error as e:
-                    conn.close()
+                except sqlite3.Error:
+                    conn.rollback()  # Explicit rollback on error
                     raise StorageError(
                         "EXEC_ERROR",
-                        f"SQLite error during import: {str(e)}",
+                        "SQLite error during CSV import",
                         {"csv": import_csv, "table": table}
                     )
-                except Exception as e:
-                    conn.close()
+                except Exception:
+                    conn.rollback()  # Explicit rollback on error
                     raise StorageError(
                         "EXEC_ERROR",
-                        f"CSV import error: {str(e)}",
+                        "CSV import failed",
                         {"csv": import_csv, "table": table},
                         hint="Try specifying delimiter, encoding, or check CSV format"
                     )
+                finally:
+                    conn.close()
             
             # =====================================================
             # SQL QUERY MODE
@@ -6622,12 +7562,15 @@ class Tools:
                 )
             
             # Block dangerous operations
+            # Strip comments first to prevent bypass attacks like AT/**/TACH
+            # Convert to uppercase to prevent case-based bypass (e.g., "attach" instead of "ATTACH")
+            query_no_comments = self._core._strip_sql_comments(query_stripped).upper()
             dangerous_patterns = [
                 "ATTACH", "DETACH",  # Could access other databases
                 "LOAD_EXTENSION",    # Could load malicious code
             ]
             for pattern in dangerous_patterns:
-                if pattern in query_stripped:
+                if pattern in query_no_comments:
                     raise StorageError(
                         "COMMAND_FORBIDDEN",
                         f"SQL operation '{pattern}' is not allowed for security reasons"
@@ -6648,10 +7591,18 @@ class Tools:
                     
                     # Check if user wants CSV export (all results, no context pollution)
                     if output_csv:
+                        # Block CSV export in readonly zones
+                        if readonly:
+                            raise StorageError(
+                                "ZONE_READONLY",
+                                "Cannot export CSV to read-only zone",
+                                {"zone": zone_name, "output_csv": output_csv},
+                                hint="Use 'storage' or 'documents' zone for CSV export"
+                            )
                         # Export all results to CSV file
                         import csv as csv_module
                         
-                        output_csv_path = self._core._validate_relative_path(output_csv)
+                        output_csv_path = self._core._validate_relative_path(output_csv, zone_name, allow_zone_in_path)
                         csv_path = self._core._resolve_chroot_path(zone_root, output_csv_path)
                         self._core._ensure_dir(csv_path.parent)
                         
@@ -6668,8 +7619,6 @@ class Tools:
                                 for row in batch:
                                     writer.writerow(list(row))
                                     row_count += 1
-                        
-                        conn.close()
                         
                         return self._core._format_response(
                             True,
@@ -6717,13 +7666,22 @@ class Tools:
                                 results = [dict(zip(columns, row)) for row in rows]
                                 truncated = False
                         else:
-                            # limit=0: no limit (user explicitly requested all)
-                            rows = cursor.fetchall()
-                            total_rows = len(rows)
-                            results = [dict(zip(columns, row)) for row in rows] if rows else []
-                            truncated = False
-                    
-                    conn.close()
+                            # limit=0: user explicitly requested all, but protect against memory exhaustion
+                            # Use fetchmany with batching up to MAX_SQL_ROWS
+                            results = []
+                            batch_size = 1000
+                            while True:
+                                batch = cursor.fetchmany(batch_size)
+                                if not batch:
+                                    break
+                                for row in batch:
+                                    results.append(dict(zip(columns, row)))
+                                    if len(results) >= MAX_SQL_ROWS:
+                                        break
+                                if len(results) >= MAX_SQL_ROWS:
+                                    break
+                            total_rows = len(results)
+                            truncated = len(results) >= MAX_SQL_ROWS
                     
                     # Build response
                     response_data = {
@@ -6752,8 +7710,7 @@ class Tools:
                     conn.commit()
                     rowcount = cursor.rowcount
                     lastrowid = cursor.lastrowid
-                    conn.close()
-                    
+
                     return self._core._format_response(
                         True,
                         data={
@@ -6765,19 +7722,21 @@ class Tools:
                         message=f"Query executed successfully ({rowcount} row(s) affected)"
                     )
                     
-            except sqlite3.Error as e:
-                conn.close()
+            except sqlite3.Error:
+                conn.rollback()  # Explicit rollback on error
                 raise StorageError(
                     "EXEC_ERROR",
-                    f"SQLite error: {str(e)}",
+                    "SQLite query failed",
                     {"query": query},
                     hint="Check your SQL syntax"
                 )
-                
+            finally:
+                conn.close()
+
         except StorageError as e:
             return self._core._format_error(e, "shed_sqlite")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error during SQLite operation")
 
     # =========================================================================
     # DOWNLOAD LINKS (3 functions)
@@ -6789,8 +7748,8 @@ class Tools:
         zone: str,
         path: str,
         group: str = None,
-        __user__: dict = {},
-        __metadata__: dict = {},
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Create a download link for a file.
@@ -6814,38 +7773,19 @@ class Tools:
             shed_link_create(zone="group", group="team", path="shared/presentation.pptx")
         """
         try:
-            # Resolve zone and path
-            zone_lower = zone.lower()
-            user_root = self._core._get_user_root(__user__)
-            
-            if zone_lower == "uploads":
-                conv_id = self._core._get_conv_id(__metadata__)
-                chroot = user_root / "Uploads" / conv_id
-            elif zone_lower == "storage":
-                chroot = user_root / "Storage" / "data"
-            elif zone_lower == "documents":
-                chroot = user_root / "Documents" / "data"
-            elif zone_lower == "group":
-                if not group:
-                    raise StorageError(
-                        "MISSING_GROUP",
-                        "Group name required for group zone",
-                        {"zone": zone},
-                        "Provide group parameter: shed_link_create(zone='group', group='team', path='...')"
-                    )
-                group_id = self._core._validate_group_id(group)
-                self._core._check_group_access(__user__, group_id)
-                chroot = Path(self.valves.storage_base_path) / "groups" / group_id / "data"
-            else:
-                raise StorageError(
-                    "INVALID_ZONE",
-                    f"Invalid zone: {zone}",
-                    {"zone": zone, "valid_zones": ["uploads", "storage", "documents", "group"]},
-                    "Use one of: uploads, storage, documents, group"
-                )
-            
+            if __user__ is None:
+                __user__ = {}
+
+            # Resolve zone using standard helper
+            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=False)
+            zone_root = ctx.zone_root
+            zone_name = ctx.zone_name
+
+            # Validate path (check for zone prefix duplication)
+            path = self._core._validate_relative_path(path, zone_name, allow_zone_in_path=False)
+
             # Resolve and validate path
-            filepath = self._core._resolve_chroot_path(chroot, path)
+            filepath = self._core._resolve_chroot_path(zone_root, path)
             
             if not filepath.exists():
                 raise StorageError(
@@ -6932,23 +7872,23 @@ class Tools:
                 # Clean up on failure
                 dest_path.unlink(missing_ok=True)
                 raise
-            except Exception as e:
+            except Exception:
                 dest_path.unlink(missing_ok=True)
                 raise StorageError(
                     "INTERNAL_API_ERROR",
-                    f"Error calling Open WebUI API: {e}",
-                    {},
+                    "Error calling Open WebUI API",
+                    None,
                     "Check Open WebUI version compatibility"
                 )
                 
         except StorageError as e:
             return self._core._format_error(e, "shed_link_create")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while creating download link")
 
     async def shed_link_list(
         self,
-        __user__: dict = {},
+        __user__: dict = None,
     ) -> str:
         """
         List all download links created by the current user.
@@ -6963,6 +7903,8 @@ class Tools:
             shed_link_list()
         """
         try:
+            if __user__ is None:
+                __user__ = {}
             user_id = __user__.get("id")
             if not user_id:
                 raise StorageError(
@@ -7023,13 +7965,13 @@ class Tools:
             
         except StorageError as e:
             return self._core._format_error(e, "shed_link_list")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while listing download links")
 
     async def shed_link_delete(
         self,
         file_id: str,
-        __user__: dict = {},
+        __user__: dict = None,
     ) -> str:
         """
         Remove a download link from Open WebUI.
@@ -7047,6 +7989,8 @@ class Tools:
             shed_link_delete(file_id="317ef925-c87a-44fd-8d29-acdccb8e6070")
         """
         try:
+            if __user__ is None:
+                __user__ = {}
             user_id = __user__.get("id")
             if not user_id:
                 raise StorageError(
@@ -7121,8 +8065,8 @@ class Tools:
             
         except StorageError as e:
             return self._core._format_error(e, "shed_link_delete")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while deleting download link")
 
     # =========================================================================
     # HOWTO GUIDES (targeted help to avoid context pollution)
@@ -7133,8 +8077,8 @@ class Tools:
     async def shed_help(
         self,
         howto: str = None,
-        __user__: dict = {},
-        __metadata__: dict = {},
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Get help for Fileshed. Call without arguments for quick reference,
@@ -7264,8 +8208,8 @@ shed_tree(zone="storage") # Directory tree
 
     async def shed_stats(
         self,
-        __user__: dict = {},
-        __metadata__: dict = {},
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Returns usage statistics.
@@ -7321,14 +8265,14 @@ shed_tree(zone="storage") # Directory tree
             }
             
             return self._core._format_response(True, data=stats)
-            
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
-    
+
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while calculating storage stats")
+
     async def shed_parameters(
         self,
-        __user__: dict = {},
-        __metadata__: dict = {},
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Returns current valve configuration (read-only).
@@ -7380,14 +8324,14 @@ shed_tree(zone="storage") # Directory tree
             }
             
             return self._core._format_response(True, data=params, message="Current valve configuration")
-            
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
-    
+
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while getting parameters")
+
     async def shed_allowed_commands(
         self,
-        __user__: dict = {},
-        __metadata__: dict = {},
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Tests available commands in container.
@@ -7460,48 +8404,52 @@ shed_tree(zone="storage") # Directory tree
             
             self._core._commands_cache = result
             return self._core._format_response(True, data=result)
-            
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
-    
+
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while listing allowed commands")
+
     async def shed_force_unlock(
         self,
         zone: str = "",
         path: str = "",
         group: str = "",
-        __user__: dict = {},
-        __metadata__: dict = {},
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Forces file unlock (crash recovery).
-        
+
         Use this if a file is stuck in edit mode after a crash.
-        
+
         :param zone: "storage" or "documents" (for personal zones)
         :param path: File path relative to zone
         :param group: Group ID (for group zones - use instead of zone)
         :return: Confirmation as JSON
-        
+
         Examples:
             shed_force_unlock(zone="storage", path="stuck_file.txt")
             shed_force_unlock(group="team", path="locked_doc.md")
         """
         try:
-            # Validate path
+            # Validate path is provided
             if not path:
                 raise StorageError("MISSING_PARAMETER", "path is required")
-            path = self._core._validate_relative_path(path)
-            
+
             # Determine if group or personal zone
             if group:
                 # Group mode
                 group = self._core._validate_group_id(group)
                 self._core._check_group_access(__user__, group)
-                
+                zone_name = f"Group:{group}"
+
+                # Validate path with zone_name
+                path = self._core._validate_relative_path(path, zone_name, allow_zone_in_path)
+
                 group_path = self._core._get_groups_root() / group
                 lock_path = group_path / "locks" / (path + ".lock")
                 editzone_base = group_path / "editzone"
-                zone_display = f"Group:{group}"
+                zone_display = zone_name
             else:
                 # Personal zone mode
                 if not zone:
@@ -7510,7 +8458,7 @@ shed_tree(zone="storage") # Directory tree
                         "Must specify either 'zone' or 'group'",
                         hint="Use zone='storage' or zone='documents', or group='group_id'"
                     )
-                
+
                 if zone.lower() not in ("storage", "documents"):
                     raise StorageError(
                         "ZONE_FORBIDDEN",
@@ -7518,11 +8466,14 @@ shed_tree(zone="storage") # Directory tree
                         {},
                         "Use 'storage' or 'documents'"
                     )
-                
+
                 user_root = self._core._get_user_root(__user__)
                 zone_name = "Storage" if zone.lower() == "storage" else "Documents"
+
+                # Validate path with zone_name
+                path = self._core._validate_relative_path(path, zone_name, allow_zone_in_path)
+
                 zone_root = user_root / zone_name
-                
                 lock_path = self._core._get_lock_path(zone_root, path)
                 editzone_base = zone_root / "editzone"
                 zone_display = zone_name
@@ -7543,13 +8494,13 @@ shed_tree(zone="storage") # Directory tree
             
         except StorageError as e:
             return self._core._format_error(e, "shed_force_unlock")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while forcing unlock")
     
     async def shed_maintenance(
         self,
-        __user__: dict = {},
-        __metadata__: dict = {},
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Cleans expired locks and orphan editzones (personal and group spaces).
@@ -7557,6 +8508,8 @@ shed_tree(zone="storage") # Directory tree
         :return: Cleanup report as JSON
         """
         try:
+            if __user__ is None:
+                __user__ = {}
             user_root = self._core._get_user_root(__user__)
             max_age_hours = self.valves.lock_max_age_hours
             now = datetime.now(timezone.utc)
@@ -7649,10 +8602,10 @@ shed_tree(zone="storage") # Directory tree
                 data=cleaned,
                 message=f"Maintenance complete: {total} element(s) cleaned"
             )
-            
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
-    
+
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error during maintenance cleanup")
+
     # =========================================================================
     # GROUP FUNCTIONS (14 functions)
     # =========================================================================
@@ -7661,7 +8614,7 @@ shed_tree(zone="storage") # Directory tree
     
     async def shed_group_list(
         self,
-        __user__: dict = {},
+        __user__: dict = None,
     ) -> str:
         """
         Lists groups the user belongs to.
@@ -7669,12 +8622,14 @@ shed_tree(zone="storage") # Directory tree
         :return: List of groups with id, name, and member count
         """
         try:
+            if __user__ is None:
+                __user__ = {}
             if not GROUPS_AVAILABLE:
                 return self._core._format_response(
                     False,
                     message="Group features are not available (Open WebUI Groups API not found)"
                 )
-            
+
             user_id = __user__.get("id", "")
             groups = self._core._get_user_groups(user_id)
             
@@ -7702,13 +8657,13 @@ shed_tree(zone="storage") # Directory tree
             
         except StorageError as e:
             return self._core._format_error(e, "shed_group_list")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while listing groups")
     
     async def shed_group_info(
         self,
         group: str,
-        __user__: dict = {},
+        __user__: dict = None,
     ) -> str:
         """
         Shows group files, ownership information, and statistics.
@@ -7790,8 +8745,8 @@ shed_tree(zone="storage") # Directory tree
             
         except StorageError as e:
             return self._core._format_error(e, "shed_group_info")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while getting group info")
     
     # --- Operations (4) ---
     
@@ -7800,24 +8755,28 @@ shed_tree(zone="storage") # Directory tree
         group: str,
         path: str,
         mode: str,
-        __user__: dict = {},
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
     ) -> str:
         """
         Changes the write mode of a file (owner only).
-        
+
         :param group: Group ID or group name
         :param path: File path
         :param mode: New mode: 'owner', 'group', or 'owner_ro'
         :return: Operation result as JSON
         """
         try:
+            if __user__ is None:
+                __user__ = {}
             # Validate group_id
             group = self._core._validate_group_id(group)
             self._core._check_group_access(__user__, group)
             user_id = __user__.get("id", "")
-            
+            zone_name = f"Group:{group}"
+
             # Validate path
-            path = self._core._validate_relative_path(path)
+            path = self._core._validate_relative_path(path, zone_name, allow_zone_in_path)
             
             # Validate mode
             if mode not in ("owner", "group", "owner_ro"):
@@ -7836,9 +8795,9 @@ shed_tree(zone="storage") # Directory tree
                 raise StorageError(
                     "NOT_FILE_OWNER",
                     "Only the file owner can change the write mode",
-                    {"owner": ownership["owner_id"], "your_id": user_id}
+                    {"path": path}
                 )
-            
+
             # Update mode
             old_mode = ownership["write_access"]
             self._core._set_file_ownership(group, path, user_id, mode)
@@ -7851,32 +8810,36 @@ shed_tree(zone="storage") # Directory tree
             
         except StorageError as e:
             return self._core._format_error(e, "shed_group_set_mode")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while setting group mode")
     
     async def shed_group_chown(
         self,
         group: str,
         path: str,
         new_owner: str,
-        __user__: dict = {},
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
     ) -> str:
         """
         Transfers file ownership to another user (owner only).
-        
+
         :param group: Group ID or group name
         :param path: File path
         :param new_owner: User ID of new owner
         :return: Operation result as JSON
         """
         try:
+            if __user__ is None:
+                __user__ = {}
             # Validate group_id
             group = self._core._validate_group_id(group)
             self._core._check_group_access(__user__, group)
             user_id = __user__.get("id", "")
-            
+            zone_name = f"Group:{group}"
+
             # Validate path
-            path = self._core._validate_relative_path(path)
+            path = self._core._validate_relative_path(path, zone_name, allow_zone_in_path)
             
             # Validate new_owner (sanitize)
             if not new_owner or not isinstance(new_owner, str):
@@ -7897,9 +8860,9 @@ shed_tree(zone="storage") # Directory tree
                 raise StorageError(
                     "NOT_FILE_OWNER",
                     "Only the file owner can transfer ownership",
-                    {"owner": ownership["owner_id"], "your_id": user_id}
+                    {"path": path}
                 )
-            
+
             # Check new owner is group member
             if not self._core._is_group_member(new_owner, group):
                 raise StorageError(
@@ -7921,8 +8884,8 @@ shed_tree(zone="storage") # Directory tree
             
         except StorageError as e:
             return self._core._format_error(e, "shed_group_chown")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while changing file ownership")
     
     # --- Bridge (1) ---
     
@@ -7934,47 +8897,58 @@ shed_tree(zone="storage") # Directory tree
         dest_path: str,
         message: str = "Add file to group",
         mode: str = None,
-        __user__: dict = {},
-        __metadata__: dict = {},
+        overwrite: bool = False,
+        allow_zone_in_path: bool = False,
+        __user__: dict = None,
+        __metadata__: dict = None,
     ) -> str:
         """
         Copies a file from personal space to group.
-        
+
         :param src_zone: Source zone ('uploads', 'storage', or 'documents')
-        :param src_path: Source file path
+        :param src_path: Source file path (relative to src_zone, don't include zone name!)
         :param group: Target group ID
-        :param dest_path: Destination path in group
+        :param dest_path: Destination path in group (don't include zone name!)
         :param message: Git commit message
         :param mode: Write mode: 'owner', 'group', or 'owner_ro' (default from config)
+        :param overwrite: If True, overwrite existing destination file (default: False)
+        :param allow_zone_in_path: Allow paths starting with zone name (default: False)
         :return: Operation result as JSON
         """
         try:
+            if __user__ is None:
+                __user__ = {}
+            if __metadata__ is None:
+                __metadata__ = {}
             # Validate group_id
             group = self._core._validate_group_id(group)
             self._core._check_group_access(__user__, group)
             user_id = __user__.get("id", "")
             conv_id = self._core._get_conv_id(__metadata__)
-            
-            # Validate paths
-            src_path = self._core._validate_relative_path(src_path)
-            dest_path = self._core._validate_relative_path(dest_path)
-            
-            # Resolve source
+
+            # Resolve source zone first to get zone_name for validation
             user_root = self._core._get_user_root(__user__)
             src_zone_lower = src_zone.lower()
-            
+
             if src_zone_lower == "uploads":
                 src_base = user_root / "Uploads" / conv_id
+                src_zone_name = "Uploads"
             elif src_zone_lower == "storage":
                 src_base = user_root / "Storage" / "data"
+                src_zone_name = "Storage"
             elif src_zone_lower == "documents":
                 src_base = user_root / "Documents" / "data"
+                src_zone_name = "Documents"
             else:
                 raise StorageError(
                     "ZONE_FORBIDDEN",
                     f"Invalid source zone: {src_zone}",
                     hint="Use 'uploads', 'storage', or 'documents'"
                 )
+
+            # Validate paths with zone name check
+            src_path = self._core._validate_relative_path(src_path, src_zone_name, allow_zone_in_path)
+            dest_path = self._core._validate_relative_path(dest_path, f"Group:{group}", allow_zone_in_path)
             
             source = self._core._resolve_chroot_path(src_base, src_path)
             
@@ -7998,8 +8972,21 @@ shed_tree(zone="storage") # Directory tree
             # Resolve destination
             data_path = self._core._ensure_group_space(group)
             dest = self._core._resolve_chroot_path(data_path, dest_path)
-            
+
             # Check if destination exists
+            if dest.exists():
+                if overwrite:
+                    if dest.is_dir():
+                        shutil.rmtree(str(dest))
+                    else:
+                        dest.unlink()
+                else:
+                    raise StorageError(
+                        "FILE_EXISTS",
+                        f"Destination exists: {dest_path}",
+                        hint="Use overwrite=True to replace the existing file"
+                    )
+
             existing = self._core._get_file_ownership(group, dest_path)
             if existing:
                 can_write, error = self._core._can_write_group_file(group, dest_path, user_id)
@@ -8036,5 +9023,5 @@ shed_tree(zone="storage") # Directory tree
             
         except StorageError as e:
             return self._core._format_error(e, "shed_copy_to_group")
-        except Exception as e:
-            return self._core._format_response(False, message=str(e))
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while copying to group")
