@@ -1801,6 +1801,24 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
         """Returns the SQLite database path."""
         return Path(self.valves.storage_base_path) / "access_auth.sqlite"
 
+    def _strip_sql_comments(self, sql: str) -> str:
+        """
+        Strips SQL comments from a query string.
+
+        Removes both block comments (/* ... */) and line comments (-- ...).
+        This prevents bypass attacks like AT/**/TACH or LOAD_EX--comment
+        TENSION.
+
+        :param sql: SQL query string
+        :return: Query with comments removed
+        """
+        import re
+        # Remove block comments (non-greedy to handle multiple comments)
+        result = re.sub(r'/\*.*?\*/', '', sql, flags=re.DOTALL)
+        # Remove line comments (-- until end of line)
+        result = re.sub(r'--[^\n]*', '', result)
+        return result
+
     def _format_size(self, size_bytes: int, short: bool = False) -> str:
         """
         Formats a byte size as a human-readable string.
@@ -7294,12 +7312,14 @@ class Tools:
                 )
             
             # Block dangerous operations
+            # Strip comments first to prevent bypass attacks like AT/**/TACH
+            query_no_comments = self._core._strip_sql_comments(query_stripped)
             dangerous_patterns = [
                 "ATTACH", "DETACH",  # Could access other databases
                 "LOAD_EXTENSION",    # Could load malicious code
             ]
             for pattern in dangerous_patterns:
-                if pattern in query_stripped:
+                if pattern in query_no_comments:
                     raise StorageError(
                         "COMMAND_FORBIDDEN",
                         f"SQL operation '{pattern}' is not allowed for security reasons"
