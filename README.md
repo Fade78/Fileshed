@@ -6,10 +6,10 @@
 
 **Store, organize, collaborate, and share files across conversations.**
 
-[![Version](https://img.shields.io/badge/version-1.0.3-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-1.0.4-blue.svg)]()
 [![Open WebUI](https://img.shields.io/badge/Open%20WebUI-Tool-green.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)]()
-[![Tests](https://img.shields.io/badge/tests-1101%20passed-brightgreen.svg)](docs/audits/fileshed/reports/Exec_tests.md)
+[![Tests](https://img.shields.io/badge/tests-1195%20passed-brightgreen.svg)](docs/audits/fileshed/reports/Exec_tests.md)
 [![Audited](https://img.shields.io/badge/audited-★★★★☆-blue.svg)](#testing--audits)
 
 ---
@@ -24,7 +24,7 @@ Fileshed gives your LLM a persistent workspace. It provides:
 - 📂 **Persistent storage** — Files survive across conversations
 - 🗃️ **Structured data** — Built-in SQLite databases, surgical file edits by line or pattern
 - 🔄 **Convert data** — ffmpeg for media, pandoc for document conversion (markdown, docx, html, LaTeX source...)
-- 📝 **Examine and modify files** — cat, touch, mkdir, rm, cp, mv, tar, gzip, zip, xxd... Work in text and binary mode
+- 📝 **Examine and modify files** — cat, touch, mkdir, rm, cp, mv, tar, gzip, zip, od... Work in text and binary mode
 - 🛡️ **Integrity** — Automatic Git versioning, safe editing with file locks
 - 🌐 **Network I/O** (optional) — Download files and clone repositories (disabled by default, admin-controlled)
 - 🧠 **Context-efficient operations** — Process files without loading them into the conversation (grep, sed, awk, curl...)
@@ -82,7 +82,7 @@ Fileshed gives your LLM a persistent workspace. It provides:
 
 > **You:** "Download data about all countries (name, area, population) from restcountries.com. Convert to CSV, load into SQLite, add a density column (population/area), sort by density, export as CSV, zip it, and give me a download link."
 > 
-> **LLM:** *(executes 10 operations automatically)*
+> **LLM:** *(executes 9 operations automatically)*
 > 1. `shed_exec` curl → downloads JSON
 > 2. `shed_exec` jq → converts to CSV  
 > 3. `shed_sqlite` import_csv → loads into database
@@ -481,8 +481,8 @@ Fileshed has been independently audited by multiple AI models and validated with
 
 | Auditor | Rating | Report |
 |---------|:------:|--------|
-| ChatGPT 5.2 Instant | ★★★★★ (5/5) | [Full report](docs/audits/fileshed/reports/openai_chatgpt_5.2_instant.md) |
-| Claude Opus 4.5 (Thinking) | ★★★★☆ (4/5) | [Full report](docs/audits/fileshed/reports/anthopic_claude_opus_4.5_thinking.md) |
+| ChatGPT 5.2 Instant | ★★★★☆ (4.5/5) | [Full report](docs/audits/fileshed/reports/openai_chatgpt_5.2_instant.md) |
+| Claude Opus 4.5 (Thinking) | ★★★★☆ (4/5) | [Full report](docs/audits/fileshed/reports/anthropic_claude_opus_4.5_thinking.md) |
 
 **Key strengths identified:**
 - Strong filesystem isolation with symlink detection
@@ -492,7 +492,7 @@ Fileshed has been independently audited by multiple AI models and validated with
 
 All issues identified during audits have been addressed.
 
-**Test coverage:** [1101 functional tests](docs/audits/fileshed/reports/Exec_tests.md) — All passing
+**Test coverage:** [1195 functional tests](docs/audits/fileshed/reports/Exec_tests.md) — All passing
 
 ---
 

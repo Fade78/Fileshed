@@ -1,291 +1,218 @@
-Below is a **deep, multi-axis security, architecture, and LLM-safety audit** of the provided codebase, performed under the stated constraints and with full consideration of the OpenWebUI execution model, trust boundaries, and administrator vs user controls.
+## Deep Security, Architecture, and LLM-Safety Audit
+
+**Audited file:** `Fileshed.py`
+**Tool version:** **1.0.4** (as declared in file header) 
+**Specification reviewed:** `SPEC.md` (design, constraints, threat model) 
+
+This audit evaluates the implementation **in the context of OpenWebUI tool execution**, LLM-driven invocation, admin-only valve configuration, and multi-user/group operation. The report focuses on alignment with the specification and on non-obvious, design-relevant risks.
 
 ---
 
-## Audit Header
+## Axis 1 — Architecture & Separation of Concerns
 
-* **Audited file:** `Fileshed.py` 
-* **Tool version:** **1.0.3** (as declared in file header)
-* **Specification reviewed:** `SPEC.md` 
+**Intent & behavior**
+The tool enforces a strict two-layer architecture: a public `Tools` surface exposing only `shed_*` methods to the LLM, and a private `_FileshedCore` containing all sensitive logic (filesystem, subprocess, Git, DB). This directly addresses OpenWebUI’s reflection model where all `Tools` methods are LLM-callable.
 
-The audit explicitly accounts for:
+**Strengths**
 
-* Execution as an **OpenWebUI Tool**, not a standalone service
-* Invocation by an **LLM via Native Function Calling**
-* **Admin-only valves** vs user/LLM-reachable inputs
-* The design constraints and philosophy documented in `SPEC.md` (not restated unless implementation-relevant)
+* Clean, explicit separation that materially reduces accidental LLM access to dangerous primitives.
+* `_OpenWebUIBridge` isolates volatile internal APIs, reducing blast radius of OpenWebUI version drift.
+* Centralized `ZoneContext` resolution aligns precisely with the spec’s architecture and avoids scattered zone logic.
 
----
+**Weaknesses / residual risks**
 
-# Axis 1 — Architectural Layering & Trust Boundaries
+* The pattern relies on developer discipline: a future contributor could accidentally add non-`shed_` methods to `Tools`.
+* No automated guard (e.g., assertion at init time) that only `shed_` methods exist on `Tools`.
 
-**Assessment:** ★★★★★
-
-### Intent & Behavior
-
-The tool enforces a **hard separation between LLM-visible APIs (`shed_*`) and internal implementation** via the `_FileshedCore` class. This aligns precisely with OpenWebUI’s exposure model, where *every method on `Tools` is callable by the LLM*.
-
-### Strengths
-
-* Correctly recognizes OpenWebUI’s reflection-based tool exposure risk.
-* `_FileshedCore` is not only private by convention but **structurally unreachable** by the LLM.
-* All dangerous primitives (filesystem resolution, subprocess execution, git operations, DB access) are centralized internally.
-* `ZoneContext` provides a single authoritative object for security-relevant state (whitelist, readonly, git_commit, group_id).
-
-### Weaknesses / Residual Risk
-
-* The correctness of this boundary depends on **never adding logic to `Tools` methods directly** in future revisions.
-* No automated guard (e.g., assertion or lint rule) enforces that invariant.
-
-### Verdict
-
-This is **best-practice architecture for OpenWebUI tools** and is implemented cleanly and consistently.
+**Rating:** ★★★★★
 
 ---
 
-# Axis 2 — Public API Exposure to the LLM
+## Axis 2 — Trust Boundaries & Execution Model (LLM vs User vs Admin)
 
-**Assessment:** ★★★★★
+**Intent & behavior**
+The design assumes:
 
-### Intent & Behavior
+* The LLM is **untrusted but constrained**.
+* End users cannot configure valves.
+* Administrators control quotas, network mode, and execution limits.
 
-Only functions prefixed with `shed_` are exposed. Extensive inline warnings and help text are present to *shape LLM behavior*, not just user behavior.
+**Strengths**
 
-### Strengths
+* Clear demarcation between admin-only valves and LLM-accessible parameters.
+* Security-sensitive features (network, curl, git push) are valve-gated, not prompt-gated.
+* Uploads zone is enforced read-only, reducing user-supplied payload execution risks.
 
-* Explicit “YOU CAN ONLY CALL shed_*” guidance directly addresses LLM misbehavior patterns.
-* Rich function-scoped help reduces the chance of the LLM inventing workflows.
-* No accidental exposure of internal helpers (`_exec_command`, `_validate_path`, etc.).
+**Weaknesses / residual risks**
 
-### Weaknesses / Residual Risk
+* The LLM remains a confused-deputy risk: it can be socially engineered to perform destructive but *authorized* actions (e.g., `rm -rf` within zone).
+* No concept of “intent confirmation” for high-impact operations; this is an explicit design choice but remains a residual risk.
 
-* The API surface is large (38 functions). While well-documented, size alone increases the chance of **emergent misuse by a misaligned LLM**.
-* No rate-limiting or call-frequency control at the function level (relies on OpenWebUI defaults).
-
-### Verdict
-
-Excellent alignment with the OpenWebUI tool model; risk is primarily proportional to power, not design flaws.
-
----
-
-# Axis 3 — Filesystem Isolation & Path Safety
-
-**Assessment:** ★★★★★
-
-### Intent & Behavior
-
-The tool provides persistent storage while preventing:
-
-* Path traversal
-* Symlink escapes
-* Cross-zone contamination
-* `.git` and other protected path modification
-
-### Strengths
-
-* All filesystem access is mediated via zone-rooted resolution.
-* External paths are *logical*, internal paths are *physical* (`data/` never leaks).
-* Uploads zone is enforced as read-only.
-* Group vs user roots are cleanly separated.
-* Editzones and locks are segregated by conversation ID.
-
-### Weaknesses / Residual Risk
-
-* Depends on `_resolve_chroot_path` correctness; no secondary OS-level sandboxing.
-* Hard links are blocked at the command level, but pre-existing hard links (if somehow introduced) could still be risky.
-
-### Verdict
-
-Strong logical isolation appropriate for an in-process OpenWebUI tool.
+**Rating:** ★★★★☆
 
 ---
 
-# Axis 4 — Command Execution & Argument-Level Safety
+## Axis 3 — Filesystem Isolation & Path Safety
 
-**Assessment:** ★★★★★
+**Intent & behavior**
+All filesystem access is intended to be chroot-like, confined to zone roots with path normalization and explicit traversal prevention.
 
-### Intent & Behavior
+**Strengths**
 
-Provide shell power without granting shell semantics.
+* Central `_resolve_chroot_path` model (per spec) prevents `..` escape and symlink abuse.
+* `.git` and internal directories are protected from modification.
+* Uploads zone is both read-only and conversation-scoped.
 
-### Strengths
+**Weaknesses / residual risks**
 
-* **Strict command whitelists**, split by zone capability.
-* Explicit **blacklist of interpreters, shells, privilege escalation tools**.
-* Subprocess invocation uses argument lists (no shell).
-* Regex-based blocking of:
+* Reliance on correct and consistent use of `_resolve_chroot_path`; any missed call is a latent escape risk.
+* Hard-link and symlink creation is removed from whitelists, but existing symlinks inside zones could still be abused if not fully resolved (implementation-dependent).
 
-  * Shell metacharacters
-  * `find -exec`
-  * `awk system()` / `getline`
-* Command-specific relaxations (`jq`, `awk`, `grep`) are narrowly scoped and justified.
-
-### Weaknesses / Residual Risk
-
-* Regex-based argument inspection is inherently heuristic.
-* Some tools (e.g., `sed`, `awk`) are Turing-complete in practice; risk is mitigated but not eliminable.
-
-### Verdict
-
-This is an unusually thorough and well-reasoned command-safety implementation for an LLM-driven environment.
+**Rating:** ★★★★☆
 
 ---
 
-# Axis 5 — Network Access & Data Exfiltration Controls
+## Axis 4 — Command Execution & Argument-Level Safety
 
-**Assessment:** ★★★★☆
+**Intent & behavior**
+The tool exposes a controlled shell via `shed_exec`, with:
 
-### Intent & Behavior
+* Explicit command whitelists per zone.
+* Global blacklists for interpreters, shells, and privilege escalation.
+* Regex-based argument sanitization to block metacharacters and dangerous flags.
 
-Prevent silent data exfiltration while allowing controlled downloads.
+**Strengths**
 
-### Strengths
+* `subprocess.run` with argument lists (no shell) is a strong baseline.
+* Fine-grained handling of edge cases (`jq`, `awk`, pipes) shows deep threat modeling.
+* Removal of historically dangerous utilities (`xargs`, `env`, `timeout`) is well-justified.
 
-* Three-tier **admin-controlled network modes** (`disabled`, `safe`, `all`).
-* Clear separation between:
+**Weaknesses / residual risks**
 
-  * Network-input commands
-  * Network-output / exfiltration-capable commands
-* Fine-grained blocking of dangerous curl, wget, and ffmpeg options.
-* Git network operations separated into fetch vs push semantics.
+* Regex-based argument filtering is complex and brittle; novel tool behaviors or obscure flags could bypass intent.
+* Some whitelisted tools (`sed`, `awk`) are inherently powerful and rely on partial pattern blocking rather than full semantic restriction.
 
-### Weaknesses / Residual Risk
-
-* In `network_mode="all"`, exfiltration is intentionally possible; this is acceptable but high-impact.
-* ffmpeg protocol filtering is complex and may lag future protocol additions.
-
-### Verdict
-
-Very strong for an in-process tool; residual risk is explicitly acknowledged and admin-controlled.
+**Rating:** ★★★★☆
 
 ---
 
-# Axis 6 — Concurrency, Locking & Crash Recovery
+## Axis 5 — Network Access & Data Exfiltration Controls
 
-**Assessment:** ★★★★☆
+**Intent & behavior**
+Network access is explicitly tiered (`disabled` / `safe` / `all`) and enforced at the command-argument level for `curl`, `git`, `ffmpeg`, and media tools.
 
-### Intent & Behavior
+**Strengths**
 
-Prevent concurrent writes and enable recovery after crashes.
+* Clear distinction between *download-only* and *exfiltration-capable* operations.
+* Granular blocking of curl/wget upload flags and ffmpeg output protocols.
+* Sensible default: network fully disabled.
 
-### Strengths
+**Weaknesses / residual risks**
 
-* Explicit lock directories with conversation scoping.
-* Locked-edit workflow enforces discipline for multi-step edits.
-* `shed_force_unlock` and `shed_maintenance` provide recovery paths.
-* Lock expiration via `lock_max_age_hours`.
+* Once `network_mode=all` is enabled by an admin, the tool becomes a high-bandwidth exfiltration vector by design.
+* URL detection relies on regex matching; protocol smuggling or indirect fetches via allowed tools remain theoretical risks.
 
-### Weaknesses / Residual Risk
-
-* Locking is advisory and filesystem-based; no atomic OS-level locking.
-* Concurrent edits across *different conversations by the same user* rely on correct lock hygiene.
-
-### Verdict
-
-Appropriate and pragmatic for OpenWebUI’s execution model.
+**Rating:** ★★★★☆
 
 ---
 
-# Axis 7 — Database & Structured Data Handling (SQLite)
+## Axis 6 — Multi-User & Group Permission Model
 
-**Assessment:** ★★★★☆
+**Intent & behavior**
+Group spaces are Git-versioned, document-only zones with explicit ownership and mode semantics enforced via SQLite.
 
-### Intent & Behavior
+**Strengths**
 
-Enable data processing without context pollution.
+* Ownership and mode model (`owner`, `group`, `owner_ro`) is simple, auditable, and well-scoped.
+* Permissions are enforced server-side, not via LLM instruction.
+* Group membership is verified against OpenWebUI’s Groups API.
 
-### Strengths
+**Weaknesses / residual risks**
 
-* CSV import avoids loading large data into LLM context.
-* Column, encoding, and delimiter detection reduce user error.
-* Hard row limits prevent accidental massive outputs.
-* Optional read-only SQLite mode.
+* SQLite is a single point of integrity; corruption or concurrent write issues could desync permissions.
+* No explicit transactional coupling between filesystem operations and permission DB updates.
 
-### Weaknesses / Residual Risk
-
-* SQLite is file-based; concurrent access edge cases may occur under heavy parallelism.
-* SQL injection is possible *by design* (user-authored queries), but scope is local and expected.
-
-### Verdict
-
-Well-scoped and safe for its intended analytical role.
+**Rating:** ★★★★☆
 
 ---
 
-# Axis 8 — Multi-User & Group Permission Model
+## Axis 7 — Concurrency, Locking & Crash Recovery
 
-**Assessment:** ★★★★★
+**Intent & behavior**
+The locked-edit workflow introduces explicit file locks, editzones, and recovery tooling.
 
-### Intent & Behavior
+**Strengths**
 
-Support collaboration without turning groups into shared scratchpads.
+* Clear three-phase workflow prevents silent overwrites.
+* Lock expiration and `shed_force_unlock` address crash scenarios.
+* Editzones are conversation-scoped, reducing cross-chat interference.
 
-### Strengths
+**Weaknesses / residual risks**
 
-* Group membership is verified via OpenWebUI’s Groups API.
-* Ownership and write-mode model (`owner`, `group`, `owner_ro`) is simple and enforceable.
-* Permission metadata stored separately from content.
-* Group zones are **Documents-only**, eliminating messy shared state.
+* Locks are advisory and filesystem-based; unexpected process termination could still leave inconsistent state until maintenance runs.
+* No OS-level file locking primitives are used.
 
-### Weaknesses / Residual Risk
-
-* Permission DB integrity depends on filesystem trust; no cryptographic binding.
-* Admins implicitly retain full power (acceptable per model).
-
-### Verdict
-
-Clean, understandable, and well-aligned with collaborative safety goals.
+**Rating:** ★★★★☆
 
 ---
 
-# Axis 9 — LLM Misuse Resistance & Prompt-Level Guardrails
+## Axis 8 — SQLite & Structured Data Handling
 
-**Assessment:** ★★★★★
+**Intent & behavior**
+SQLite is used both as a user-facing data tool and as an internal permission store.
 
-### Intent & Behavior
+**Strengths**
 
-Assume the LLM is fallible and sometimes adversarial.
+* CSV import limits (columns, batch sizes) reduce DoS risk.
+* SELECT output limits protect LLM context.
+* Optional read-only mode is valve-controlled.
 
-### Strengths
+**Weaknesses / residual risks**
 
-* Explicit warnings aimed at the LLM, not just humans.
-* Workflow-oriented help reduces tool confusion.
-* Strong bias toward **shell commands first**, reducing bespoke logic paths.
-* Output truncation protects context window integrity.
+* Complex CSV auto-detection increases parsing attack surface.
+* User-controlled SQL (even SELECT) can still be computationally expensive.
 
-### Weaknesses / Residual Risk
+**Rating:** ★★★★☆
 
-* No explicit per-conversation quota on number of tool calls.
-* A sufficiently misaligned LLM could still perform destructive actions *within its own space*.
+---
 
-### Verdict
+## Axis 9 — LLM Misuse Resistance & Prompt Adversariality
 
-Exemplary for an LLM-facing tool; realistic threat model.
+**Intent & behavior**
+The tool assumes the LLM may behave adversarially or be prompt-injected, and constrains it structurally rather than by instruction.
+
+**Strengths**
+
+* No reliance on “don’t do X” prompting; enforcement is code-level.
+* Public API surface is intentionally narrow and explicit.
+* Extensive inline warnings and help steer the LLM toward safe workflows.
+
+**Weaknesses / residual risks**
+
+* The LLM can still intentionally perform destructive actions that are *allowed* (e.g., deleting all user files).
+* No rate-limiting or anomaly detection on repeated destructive calls.
+
+**Rating:** ★★★★☆
 
 ---
 
 ## Final Overall Assessment
 
-**Overall Rating:** **★★★★★**
+**Overall rating:** **★★★★☆ (4.5 / 5)**
 
-This tool demonstrates **exceptional security maturity for an OpenWebUI in-process tool**.
-The strongest aspects are:
+Weighted toward security and isolation, Fileshed demonstrates **exceptionally strong architectural discipline** for an LLM-invoked tool. The design aligns closely with the specification and shows mature threat modeling, particularly around shell execution and network exfiltration.
 
-* Correct handling of OpenWebUI’s reflection-based exposure model
-* Deep, defense-in-depth command and filesystem safety
-* Clear admin vs user vs LLM trust boundaries
-* Thoughtful accommodation of LLM failure modes
-
-The final rating is weighted heavily toward **security, isolation, and misuse resistance**, where Fileshed performs extremely well.
+Residual risks are largely **intentional and documented trade-offs**, not oversights.
 
 ---
 
-## Actionable Improvement Recommendations
+## Concrete, Actionable Improvement Recommendations
 
-1. **Add invariant checks** (or comments enforced by tests) to prevent future logic from creeping into `Tools` methods.
-2. Consider **lightweight per-conversation rate limiting** for destructive operations (delete, overwrite) to mitigate runaway LLM loops.
-3. Document explicitly (in `SPEC.md`) the **risk acceptance** of `network_mode="all"` to aid operators in threat modeling.
-4. Optional: add integrity checks or journaling for the group permission database to aid forensic analysis.
+1. **Add an automated guard on `Tools` initialization** to assert that only `shed_*` methods are publicly exposed.
+2. **Harden argument validation** by supplementing regex checks with per-command semantic validation for the riskiest tools (`sed`, `awk`, `ffmpeg`).
+3. **Introduce optional admin-level destructive-action confirmation** (e.g., valve-controlled soft-confirmation for recursive deletes).
+4. **Improve coupling between permission DB and filesystem operations** (transaction-like rollback on partial failures).
+5. **Add lightweight audit logging hooks** for high-impact operations (delete, chmod, group chown) to aid incident review.
 
-No critical security issues were identified.
+This tool is suitable for production deployment in OpenWebUI environments with a strong security posture, provided administrators understand and intentionally configure network and quota valves.
 

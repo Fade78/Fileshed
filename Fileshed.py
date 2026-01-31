@@ -2,7 +2,7 @@
 title: Fileshed
 description: Persistent file storage with group collaboration. FIRST: Run shed_help() for quick reference or shed_help(howto="...") for guides: download, csv_to_sqlite, upload, share, edit, commands, network, paths, large_files, full. Config: shed_parameters().
 author: Fade78 (with Claude Opus 4.5)
-version: 1.0.3
+version: 1.0.4
 license: MIT
 required_open_webui_version: 0.4.0
 
@@ -2729,10 +2729,22 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                 cwd=str(cwd),
                 stdout=stdout_handle,
                 stderr=stderr_handle,
-                text=True,
+                text=False,  # Handle binary output gracefully
                 timeout=timeout,
                 preexec_fn=set_resource_limits,
             )
+
+            # Decode output with error handling for binary content
+            # Using 'replace' replaces non-UTF8 bytes with � (U+FFFD)
+            if result.stdout is not None and not isinstance(result.stdout, str):
+                result_stdout = result.stdout.decode('utf-8', errors='replace')
+            else:
+                result_stdout = result.stdout or ""
+
+            if result.stderr is not None and not isinstance(result.stderr, str):
+                result_stderr = result.stderr.decode('utf-8', errors='replace')
+            else:
+                result_stderr = result.stderr or ""
             
             # Close files before reading them
             for f in files_to_close:
@@ -2745,7 +2757,7 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                 stdout_truncated = False
             else:
                 effective_max = self._calculate_effective_max(max_output)
-                stdout, stdout_truncated = self._truncate_output(result.stdout or "", effective_max)
+                stdout, stdout_truncated = self._truncate_output(result_stdout, effective_max)
 
             # Get stderr content
             if stderr_file:
@@ -2756,7 +2768,7 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                 stderr_truncated = False
             else:
                 effective_max = self._calculate_effective_max(max_output)
-                stderr, stderr_truncated = self._truncate_output(result.stderr or "", effective_max)
+                stderr, stderr_truncated = self._truncate_output(result_stderr, effective_max)
             
             response = {
                 "success": result.returncode == 0,
@@ -3131,10 +3143,28 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
         self._git_run(["commit", "-m", message, "--allow-empty-message"], repo_path)
 
     def _git_commit_as_user(self, repo_path: Path, message: str, user_id: str) -> None:
-        """Performs a Git commit with user as author."""
-        self._git_run(["add", "-A"], repo_path)
-        author = f"{user_id} <{user_id}@fileshed>"
-        self._git_run(["commit", "--author", author, "-m", message, "--allow-empty-message"], repo_path)
+        """Performs a Git commit with user as author (used for group operations).
+
+        Uses a lock to prevent concurrent Git operations on the same repository.
+        This is important for group spaces where multiple users may commit simultaneously.
+        """
+        import fcntl
+        git_lock_path = repo_path / ".git" / "fileshed_git.lock"
+
+        # Ensure .git directory exists
+        git_lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Acquire exclusive lock on the git repository
+        lock_fd = open(git_lock_path, 'w')
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)  # Blocking exclusive lock
+
+            self._git_run(["add", "-A"], repo_path)
+            author = f"{user_id} <{user_id}@fileshed>"
+            self._git_run(["commit", "--author", author, "-m", message, "--allow-empty-message"], repo_path)
+        finally:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+            lock_fd.close()
     
     # =========================================================================
     # GROUP HELPERS
@@ -3165,6 +3195,8 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ownership_group ON file_ownership(group_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ownership_owner ON file_ownership(owner_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ownership_path ON file_ownership(group_id, file_path)")
+            # Enable WAL mode for better concurrent read/write performance
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.commit()
         finally:
             conn.close()
@@ -3173,22 +3205,44 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
 
     def _db_execute(self, query: str, params: tuple = ()) -> tuple:
         """
-        Execute a database query.
+        Execute a database query with automatic retry on transient errors.
+
         Returns (rows, rowcount) tuple:
         - rows: list of Row objects for SELECT, empty list for others
         - rowcount: number of affected rows for INSERT/UPDATE/DELETE
+
+        Retries automatically on SQLite busy/locked errors to minimize
+        round-trips with the LLM (each failed call is expensive).
         """
+        import time
+
         self._init_db()
-        conn = sqlite3.connect(str(self._get_db_path()), timeout=10.0, isolation_level="IMMEDIATE")
-        conn.row_factory = sqlite3.Row
-        try:
-            cursor = conn.execute(query, params)
-            result = cursor.fetchall()
-            rowcount = cursor.rowcount
-            conn.commit()
-            return result, rowcount
-        finally:
-            conn.close()
+
+        max_retries = 3
+        base_delay = 0.1  # 100ms initial delay
+
+        for attempt in range(max_retries + 1):
+            conn = sqlite3.connect(str(self._get_db_path()), timeout=10.0, isolation_level="IMMEDIATE")
+            conn.row_factory = sqlite3.Row
+            try:
+                cursor = conn.execute(query, params)
+                result = cursor.fetchall()
+                rowcount = cursor.rowcount
+                conn.commit()
+                return result, rowcount
+            except sqlite3.OperationalError as e:
+                conn.close()
+                # Retry on transient errors (busy, locked)
+                if attempt < max_retries and ("locked" in str(e).lower() or "busy" in str(e).lower()):
+                    delay = base_delay * (2 ** attempt)  # Exponential backoff: 0.1, 0.2, 0.4s
+                    time.sleep(delay)
+                    continue
+                raise
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def _get_user_groups(self, user_id: str) -> list:
         """Get groups the user belongs to via Open WebUI API."""
@@ -4679,43 +4733,47 @@ class Tools:
             shed_create_file(zone="storage", path="data.bin", content="48454C4C4F", file_type="bytes")
             shed_create_file(zone="storage", path="img.png", content="iVBORw0K...", file_type="bytes", content_format="base64")
         """
-        # Validate file_type
-        file_type_lower = file_type.lower() if isinstance(file_type, str) else ""
-        if file_type_lower not in ("text", "bytes"):
-            return self._core._format_response(
-                False,
-                error="INVALID_PARAMETER",
-                message=f"file_type must be 'text' or 'bytes', got: {repr(file_type)}",
-                hint="Use file_type='text' for text files or file_type='bytes' for binary"
-            )
-
-        # Delegate to appropriate patch function with overwrite=True
-        if file_type_lower == "bytes":
-            result = await self.shed_patch_bytes(
-                zone=zone, path=path, content=content,
-                content_format=content_format, overwrite=True,
-                group=group, message=message, mode=mode,
-                allow_zone_in_path=allow_zone_in_path,
-                __user__=__user__, __metadata__=__metadata__,
-            )
-        else:
-            result = await self.shed_patch_text(
-                zone=zone, path=path, content=content,
-                overwrite=True, group=group, message=message, mode=mode,
-                allow_zone_in_path=allow_zone_in_path,
-                __user__=__user__, __metadata__=__metadata__,
-            )
-
-        # Add hint explaining this is a wrapper function
         try:
-            import json
-            parsed = json.loads(result)
-            if parsed.get("success"):
-                parsed["hint"] = "shed_create_file is a wrapper for shed_patch_text/bytes with overwrite=True. It exists because it's intuitive to find and use."
-                return json.dumps(parsed)
-        except (json.JSONDecodeError, TypeError):
-            pass
-        return result
+            # Validate file_type
+            file_type_lower = file_type.lower() if isinstance(file_type, str) else ""
+            if file_type_lower not in ("text", "bytes"):
+                raise StorageError(
+                    "INVALID_PARAMETER",
+                    f"file_type must be 'text' or 'bytes', got: {repr(file_type)}",
+                    hint="Use file_type='text' for text files or file_type='bytes' for binary"
+                )
+
+            # Delegate to appropriate patch function with overwrite=True
+            if file_type_lower == "bytes":
+                result = await self.shed_patch_bytes(
+                    zone=zone, path=path, content=content,
+                    content_format=content_format, overwrite=True,
+                    group=group, message=message, mode=mode,
+                    allow_zone_in_path=allow_zone_in_path,
+                    __user__=__user__, __metadata__=__metadata__,
+                )
+            else:
+                result = await self.shed_patch_text(
+                    zone=zone, path=path, content=content,
+                    overwrite=True, group=group, message=message, mode=mode,
+                    allow_zone_in_path=allow_zone_in_path,
+                    __user__=__user__, __metadata__=__metadata__,
+                )
+
+            # Add hint explaining this is a wrapper function
+            try:
+                import json
+                parsed = json.loads(result)
+                if parsed.get("success"):
+                    parsed["hint"] = "shed_create_file is a wrapper for shed_patch_text/bytes with overwrite=True. It exists because it's intuitive to find and use."
+                    return json.dumps(parsed)
+            except (json.JSONDecodeError, TypeError):
+                pass
+            return result
+        except StorageError as e:
+            return self._core._format_error(e, "shed_create_file")
+        except Exception:
+            return self._core._format_response(False, message="Unexpected error while creating file")
 
     async def shed_patch_text(
         self,
@@ -4754,7 +4812,9 @@ class Tools:
         :param match_all: Replace all pattern matches (default: first only)
         :param overwrite: True=replace entire file content, False=patch at position (default: False).
                           Note: overwrite=False on existing file APPENDS/PATCHES, does NOT fail!
-        :param safe: Lock file during edit
+        :param safe: Lock file during edit (default: True). Set False for slightly better
+                     performance but risk of data loss if multiple conversations edit the
+                     same file simultaneously (not recommended)
         :param group: Group name/ID (required if zone="group")
         :param message: Git commit message (documents/group only, ignored for storage)
         :param mode: Ownership mode for new files in group: "owner", "group", "owner_ro"
@@ -4811,7 +4871,9 @@ class Tools:
         :param offset: Byte offset for "at"/"replace"
         :param length: Bytes to replace for "replace"
         :param overwrite: True=replace entire file, False=patch at position (default: False)
-        :param safe: Lock file during edit
+        :param safe: Lock file during edit (default: True). Set False for slightly better
+                     performance but risk of data loss if multiple conversations edit the
+                     same file simultaneously (not recommended)
         :param group: Group name/ID (required if zone="group")
         :param message: Git commit message (documents/group only)
         :param mode: Ownership mode for new files in group
@@ -4992,14 +5054,19 @@ class Tools:
             
             # Create parent directories
             new_target.parent.mkdir(parents=True, exist_ok=True)
-            
-            # Rename
+
+            # Rename with DB rollback protection
             old_target.rename(new_target)
-            
-            # Update ownership records
+
+            # Update ownership records (rollback FS if DB fails)
             if ctx.group_id:
-                self._core._update_file_ownership_paths(ctx.group_id, old_path, new_path)
-            
+                try:
+                    self._core._update_file_ownership_paths(ctx.group_id, old_path, new_path)
+                except Exception:
+                    # Rollback filesystem rename to maintain FS/DB consistency
+                    new_target.rename(old_target)
+                    raise
+
             # Git commit
             if ctx.git_commit:
                 self._core._git_run(["add", "-A"], ctx.zone_root)
@@ -8518,6 +8585,7 @@ shed_tree(zone="storage") # Directory tree
                 "expired_locks": [],
                 "corrupted_locks": [],
                 "orphan_editzones": [],
+                "orphan_ownerships": [],
             }
             
             def clean_zone(zone_root: Path, zone_name: str):
@@ -8592,10 +8660,31 @@ shed_tree(zone="storage") # Directory tree
                 group_path = groups_root / group.id
                 if group_path.exists():
                     clean_zone(group_path, f"Group:{group.id}")
-            
-            total = (len(cleaned["expired_locks"]) + 
-                    len(cleaned["corrupted_locks"]) + 
-                    len(cleaned["orphan_editzones"]))
+
+            # Clean orphan ownerships (DB records for files that no longer exist)
+            for group in user_groups:
+                group_path = groups_root / group.id
+                data_path = group_path / "data"
+                if data_path.exists():
+                    try:
+                        all_ownership, _ = self._core._db_execute(
+                            "SELECT file_path FROM file_ownership WHERE group_id = ?",
+                            (group.id,)
+                        )
+                        for row in all_ownership:
+                            file_path = data_path / row["file_path"]
+                            if not file_path.exists():
+                                self._core._delete_file_ownership(group.id, row["file_path"])
+                                cleaned["orphan_ownerships"].append(
+                                    f"Group:{group.id}/{row['file_path']}"
+                                )
+                    except Exception:
+                        pass  # Skip group on error
+
+            total = (len(cleaned["expired_locks"]) +
+                    len(cleaned["corrupted_locks"]) +
+                    len(cleaned["orphan_editzones"]) +
+                    len(cleaned["orphan_ownerships"]))
             
             return self._core._format_response(
                 True,

@@ -570,6 +570,10 @@ Example of a **good** error (self-correcting):
 
 - **No quota caching.** Every write operation recalculates disk usage in real-time (O(n) files). This is intentional: simplicity and reliability over performance. A cache would introduce invalidation problems, undetected quota overruns, and subtle bugs. The usage context (LLM tool, not high-performance filesystem) doesn't justify the complexity.
 
+### Automatic Retries
+
+- **SQLite retry with backoff.** Database operations automatically retry on transient errors (busy, locked) with exponential backoff (0.1s, 0.2s, 0.4s). This is consistent with the "minimize round-trips" philosophy: returning an error to the LLM forces a retry at the conversation level, which is far more expensive (API call, context re-sent, token consumption) than a sub-second internal retry.
+
 ### SQLite Security
 
 - **ATTACH DATABASE, DETACH, and LOAD_EXTENSION are blocked.** These commands could access files outside the intended scope or load malicious code. Blocking is implemented via pattern detection in SQL queries.
@@ -606,6 +610,8 @@ Example of a **good** error (self-correcting):
 
 - **File-based locks.** Locks use `os.open()` with `O_CREAT | O_EXCL` for atomic acquisition. This mechanism works for a single OpenWebUI instance.
 - **No distributed locks.** File locks are unreliable across multiple instances/containers sharing NFS storage. For multi-instance deployments, an external locking mechanism (Redis, database) would be needed. This use case is not supported in the current version.
+- **Group permissions TOCTOU.** A theoretical race condition exists: User A checks permissions (mode=group, can write), User B changes mode to owner_ro, User A writes anyway. This risk is accepted because: (1) extremely rare — requires two users acting on the same file at the exact same moment, (2) mode is set at transfer time via `shed_copy_to_group(mode=...)`, (3) group spaces are Git-versioned — all changes are traceable and recoverable, (4) adding permission locks would introduce complexity disproportionate to the risk.
+- **Git lock for groups only.** Group Git operations use `fcntl.flock()` to prevent concurrent commits from mixing changes. Personal Documents zone does not use this lock — if a user has multiple conversations committing simultaneously to their Documents, commits may interleave. This is accepted because: (1) it's the same user's own files, (2) Git history preserves all changes, (3) the performance cost of locking personal operations is not justified.
 
 ### OpenWebUI Dependencies
 
