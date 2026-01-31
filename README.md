@@ -10,7 +10,7 @@
 [![Open WebUI](https://img.shields.io/badge/Open%20WebUI-Tool-green.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)]()
 [![Tests](https://img.shields.io/badge/tests-1195%20passed-brightgreen.svg)](docs/audits/fileshed/reports/Exec_tests.md)
-[![Audited](https://img.shields.io/badge/audited-★★★★☆-blue.svg)](#testing--audits)
+[![AI-Reviewed](https://img.shields.io/badge/AI--reviewed-★★★★☆-blue.svg)](#testing--security-reviews)
 
 ---
 
@@ -475,12 +475,12 @@ shed_patch_text(zone="storage", path="projects/2024/.keep", content="")
 
 ---
 
-## Testing & Audits
+## Testing & Security Reviews
 
-Fileshed has been independently audited by multiple AI models and validated with comprehensive functional tests.
+Fileshed has been reviewed for security by multiple AI models and validated with comprehensive functional tests.
 
-| Auditor | Rating | Report |
-|---------|:------:|--------|
+| Reviewer | Rating | Report |
+|----------|:------:|--------|
 | ChatGPT 5.2 Instant | ★★★★☆ (4.5/5) | [Full report](docs/audits/fileshed/reports/openai_chatgpt_5.2_instant.md) |
 | Claude Opus 4.5 (Thinking) | ★★★★☆ (4/5) | [Full report](docs/audits/fileshed/reports/anthropic_claude_opus_4.5_thinking.md) |
 
@@ -490,7 +490,9 @@ Fileshed has been independently audited by multiple AI models and validated with
 - Comprehensive network exfiltration controls
 - Clean separation between LLM-facing API and internal logic
 
-All issues identified during audits have been addressed.
+All issues identified during reviews have been addressed.
+
+> **Note:** This is an AI-assisted security review, not a formal third-party audit. Users requiring certified security audits for compliance purposes should conduct their own assessment.
 
 **Test coverage:** [1195 functional tests](docs/audits/fileshed/reports/Exec_tests.md) — All passing
 
