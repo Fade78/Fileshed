@@ -6,10 +6,10 @@
 
 **Store, organize, collaborate, and share files across conversations.**
 
-[![Version](https://img.shields.io/badge/version-1.0.4-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-1.0.5-blue.svg)]()
 [![Open WebUI](https://img.shields.io/badge/Open%20WebUI-Tool-green.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)]()
-[![Tests](https://img.shields.io/badge/tests-1195%20passed-brightgreen.svg)](docs/audits/fileshed/reports/Exec_tests.md)
+[![Tests](https://img.shields.io/badge/tests-1200%20passed-brightgreen.svg)](docs/audits/fileshed/reports/Exec_tests.md)
 [![AI-Reviewed](https://img.shields.io/badge/AI--reviewed-★★★★☆-blue.svg)](#testing--security-reviews)
 
 ---
@@ -494,7 +494,7 @@ All issues identified during reviews have been addressed.
 
 > **Note:** This is an AI-assisted security review, not a formal third-party audit. Users requiring certified security audits for compliance purposes should conduct their own assessment.
 
-**Test coverage:** [1195 functional tests](docs/audits/fileshed/reports/Exec_tests.md) — All passing
+**Test coverage:** [1200 functional tests](docs/audits/fileshed/reports/Exec_tests.md) — All passing
 
 ---
 

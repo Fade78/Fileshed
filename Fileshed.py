@@ -2,7 +2,7 @@
 title: Fileshed
 description: Persistent file storage with group collaboration. FIRST: Run shed_help() for quick reference or shed_help(howto="...") for guides: download, csv_to_sqlite, upload, share, edit, commands, network, paths, large_files, full. Config: shed_parameters().
 author: Fade78 (with Claude Opus 4.5)
-version: 1.0.4
+version: 1.0.5
 license: MIT
 required_open_webui_version: 0.4.0
 
@@ -1819,6 +1819,22 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
         """Returns the SQLite database path."""
         return Path(self.valves.storage_base_path) / "access_auth.sqlite"
 
+    def _apply_sqlite_journal_mode(self, conn) -> None:
+        """
+        Apply configured journal mode to SQLite connection.
+
+        Uses the sqlite_journal_mode valve. Falls back to WAL if invalid.
+        Silently ignores errors (e.g., non-database files).
+        """
+        try:
+            mode = self.valves.sqlite_journal_mode.upper()
+            if mode in ("WAL", "DELETE", "TRUNCATE", "MEMORY"):
+                conn.execute(f"PRAGMA journal_mode={mode}")
+            else:
+                conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.Error:
+            pass  # Ignore journal mode errors (e.g., non-database files)
+
     def _strip_sql_comments(self, sql: str) -> str:
         """
         Strips SQL comments from a query string.
@@ -3195,8 +3211,8 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ownership_group ON file_ownership(group_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ownership_owner ON file_ownership(owner_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ownership_path ON file_ownership(group_id, file_path)")
-            # Enable WAL mode for better concurrent read/write performance
-            conn.execute("PRAGMA journal_mode=WAL")
+            # Set journal mode (WAL by default, but DELETE is safer for NFS)
+            self._apply_sqlite_journal_mode(conn)
             conn.commit()
         finally:
             conn.close()
@@ -4515,7 +4531,11 @@ class Tools:
             default=False,
             description="If True, SQLite queries are restricted to SELECT only (no INSERT/UPDATE/DELETE/DROP). Safer for untrusted data."
         )
-    
+        sqlite_journal_mode: str = Field(
+            default="wal",
+            description="SQLite journal mode: 'wal' (default, fast), 'delete' (NFS-safe), 'truncate', 'memory'"
+        )
+
     class UserValves(BaseModel):
         """Per-user configuration. Users can set these in Tools > Fileshed > Settings."""
         # Note: shed_link_* functions use internal API, no user configuration needed
@@ -7233,10 +7253,13 @@ class Tools:
                     pass
                 
                 conn = sqlite3.connect(str(db_path), timeout=30.0)
-                
+
                 try:
+                    # Apply journal mode from valve (DELETE is safer for NFS)
+                    self._core._apply_sqlite_journal_mode(conn)
+
                     cursor = conn.cursor()
-                    
+
                     # Check if table exists
                     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
                     table_exists = cursor.fetchone() is not None
@@ -7647,8 +7670,11 @@ class Tools:
             params = params or []
             conn = sqlite3.connect(str(db_path), timeout=10.0)
             conn.row_factory = sqlite3.Row
-            
+
             try:
+                # Apply journal mode from valve (DELETE is safer for NFS)
+                self._core._apply_sqlite_journal_mode(conn)
+
                 cursor = conn.cursor()
                 cursor.execute(query, params)
                 

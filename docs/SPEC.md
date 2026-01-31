@@ -416,6 +416,7 @@ The following patterns are blocked in all arguments:
 | `max_output_default` | 50000 | Default output truncation (~50KB) |
 | `max_output_absolute` | 5000000 | Absolute max output (~5MB) |
 | `sqlite_readonly` | `false` | Restrict SQLite to SELECT only |
+| `sqlite_journal_mode` | `wal` | SQLite journal mode: `wal`, `delete` (NFS-safe), `truncate`, `memory` |
 
 ## Error Handling
 
@@ -526,7 +527,7 @@ All functions return JSON with consistent structure:
 
 ## Design Rationale
 
-This section documents deliberate design decisions and their justifications. It helps auditors understand intentional trade-offs and avoid false positives.
+This section documents deliberate design decisions and their justifications. It helps reviewers understand intentional trade-offs and avoid false positives.
 
 ### General Principles
 
@@ -617,6 +618,43 @@ Example of a **good** error (self-correcting):
 
 - **Internal APIs.** Fileshed uses OpenWebUI internal APIs (`open_webui.models.*`). These APIs may change between versions. Current target version is OpenWebUI 0.4.0+.
 - **Bridge pattern.** `_OpenWebUIBridge` isolates version-specific imports to facilitate adaptation to future versions.
+
+---
+
+## Network Filesystem Deployment
+
+Fileshed supports deployment on network filesystems (NFS, SMB/CIFS, GlusterFS) for **single-instance** configurations.
+
+### Recommended NFS Mount Options
+
+```bash
+mount -t nfs -o noac,actimeo=0,nfsvers=4.1 server:/share /mnt/data
+```
+
+- `noac` — Disable attribute caching (ensures fresh metadata)
+- `actimeo=0` — Disable all caching
+- `nfsvers=4.1` — Use NFSv4.1+ for better lock support
+
+### SQLite on NFS
+
+For NFS deployments, disable WAL mode:
+
+```
+sqlite_journal_mode = "delete"
+```
+
+WAL mode uses memory-mapped files (`-shm`) which are unreliable on NFS.
+
+Alternative modes:
+- `delete` — Recommended for NFS, uses traditional rollback journal
+- `truncate` — Similar to delete, slightly faster on some filesystems
+- `memory` — Journal in RAM only (⚠️ data loss risk on crash)
+
+### Limitations
+
+- **Multi-instance not supported:** File locks (`O_EXCL`) and Git locks (`flock`) do not work reliably across multiple NFS clients
+- **Quota precision:** File size calculations may be slightly stale due to NFS caching
+- **Performance:** Network latency affects all file operations
 
 ---
 
