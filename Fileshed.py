@@ -3195,8 +3195,12 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ownership_group ON file_ownership(group_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ownership_owner ON file_ownership(owner_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ownership_path ON file_ownership(group_id, file_path)")
-            # Enable WAL mode for better concurrent read/write performance
-            conn.execute("PRAGMA journal_mode=WAL")
+            # Set journal mode (WAL by default, but DELETE is safer for NFS)
+            journal_mode = self.valves.sqlite_journal_mode.upper()
+            if journal_mode in ("WAL", "DELETE", "TRUNCATE", "MEMORY"):
+                conn.execute(f"PRAGMA journal_mode={journal_mode}")
+            else:
+                conn.execute("PRAGMA journal_mode=WAL")
             conn.commit()
         finally:
             conn.close()
@@ -4515,7 +4519,11 @@ class Tools:
             default=False,
             description="If True, SQLite queries are restricted to SELECT only (no INSERT/UPDATE/DELETE/DROP). Safer for untrusted data."
         )
-    
+        sqlite_journal_mode: str = Field(
+            default="wal",
+            description="SQLite journal mode: 'wal' (default, fast), 'delete' (NFS-safe), 'truncate', 'memory'"
+        )
+
     class UserValves(BaseModel):
         """Per-user configuration. Users can set these in Tools > Fileshed > Settings."""
         # Note: shed_link_* functions use internal API, no user configuration needed
@@ -7233,10 +7241,16 @@ class Tools:
                     pass
                 
                 conn = sqlite3.connect(str(db_path), timeout=30.0)
-                
+                # Apply journal mode from valve (DELETE is safer for NFS)
+                journal_mode = self.valves.sqlite_journal_mode.upper()
+                if journal_mode in ("WAL", "DELETE", "TRUNCATE", "MEMORY"):
+                    conn.execute(f"PRAGMA journal_mode={journal_mode}")
+                else:
+                    conn.execute("PRAGMA journal_mode=WAL")
+
                 try:
                     cursor = conn.cursor()
-                    
+
                     # Check if table exists
                     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
                     table_exists = cursor.fetchone() is not None
@@ -7646,8 +7660,14 @@ class Tools:
             # Execute the query
             params = params or []
             conn = sqlite3.connect(str(db_path), timeout=10.0)
+            # Apply journal mode from valve (DELETE is safer for NFS)
+            journal_mode = self.valves.sqlite_journal_mode.upper()
+            if journal_mode in ("WAL", "DELETE", "TRUNCATE", "MEMORY"):
+                conn.execute(f"PRAGMA journal_mode={journal_mode}")
+            else:
+                conn.execute("PRAGMA journal_mode=WAL")
             conn.row_factory = sqlite3.Row
-            
+
             try:
                 cursor = conn.cursor()
                 cursor.execute(query, params)
