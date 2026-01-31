@@ -2729,10 +2729,22 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                 cwd=str(cwd),
                 stdout=stdout_handle,
                 stderr=stderr_handle,
-                text=True,
+                text=False,  # Handle binary output gracefully
                 timeout=timeout,
                 preexec_fn=set_resource_limits,
             )
+
+            # Decode output with error handling for binary content
+            # Using 'replace' replaces non-UTF8 bytes with � (U+FFFD)
+            if result.stdout is not None and not isinstance(result.stdout, str):
+                result_stdout = result.stdout.decode('utf-8', errors='replace')
+            else:
+                result_stdout = result.stdout or ""
+
+            if result.stderr is not None and not isinstance(result.stderr, str):
+                result_stderr = result.stderr.decode('utf-8', errors='replace')
+            else:
+                result_stderr = result.stderr or ""
             
             # Close files before reading them
             for f in files_to_close:
@@ -2745,7 +2757,7 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                 stdout_truncated = False
             else:
                 effective_max = self._calculate_effective_max(max_output)
-                stdout, stdout_truncated = self._truncate_output(result.stdout or "", effective_max)
+                stdout, stdout_truncated = self._truncate_output(result_stdout, effective_max)
 
             # Get stderr content
             if stderr_file:
@@ -2756,7 +2768,7 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                 stderr_truncated = False
             else:
                 effective_max = self._calculate_effective_max(max_output)
-                stderr, stderr_truncated = self._truncate_output(result.stderr or "", effective_max)
+                stderr, stderr_truncated = self._truncate_output(result_stderr, effective_max)
             
             response = {
                 "success": result.returncode == 0,
