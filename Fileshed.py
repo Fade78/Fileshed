@@ -59,8 +59,16 @@ Option 2 - Per Chat:
 #    NEVER expose "data/" in help, messages, or errors. The LLM sees:
 #      Storage/myfile.txt  (not Storage/data/myfile.txt)
 #
+# 3. OPEN WEBUI API: since Open WebUI 0.9.0 the models layer (Files, Groups,
+#    ...) is async. NEVER call it directly: route every call through
+#    `await _owui_call(...)`, which awaits when needed and still works on the
+#    older synchronous API (<= 0.8.x). Calling it directly returns a coroutine
+#    that is never awaited: the database operation silently does not happen and
+#    the truthy coroutine object slips past `if not result:` guards.
+#
 # =============================================================================
 
+import inspect
 import json
 import mimetypes
 import os
@@ -85,6 +93,28 @@ try:
     GROUPS_AVAILABLE = True
 except ImportError:
     pass
+
+
+async def _owui_call(result: Any) -> Any:
+    """
+    Normalizes a call to Open WebUI's internal models API.
+
+    Open WebUI 0.9.0 turned the whole models layer (Files, Groups, ...) into
+    coroutine functions. Calling them the old way returns a coroutine that is
+    never awaited: the database operation silently never happens, and the
+    returned object is truthy, so `if not result:` guards do not catch it.
+
+    Pass the raw call through this helper so both API generations work:
+
+        item = await _owui_call(Files.insert_new_file(user_id, form))
+
+    :param result: Return value of an Open WebUI models call
+    :return: The resolved value (awaited when the API is async)
+    """
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
 
 # Try to import cryptography library for encryption support
 CRYPTO_AVAILABLE = False
@@ -428,8 +458,12 @@ class _OpenWebUIBridge:
     
     This class isolates all direct interactions with Open WebUI's internal modules.
     If Open WebUI's internal API changes between versions, only this class needs updating.
-    
-    Supported Open WebUI versions: 0.6.x (tested with 0.6.40+)
+
+    Supported Open WebUI versions: 0.6.x through 0.11.x.
+
+    Since 0.9.0 the models layer is async, so every method here is a coroutine
+    and routes its call through _owui_call() to stay compatible with the older
+    synchronous API.
     """
     
     _instance = None
@@ -474,7 +508,7 @@ class _OpenWebUIBridge:
                 "Open WebUI internal modules not available. This feature requires running inside Open WebUI."
             )
     
-    def insert_file(
+    async def insert_file(
         self,
         user_id: str,
         file_id: str,
@@ -500,9 +534,9 @@ class _OpenWebUIBridge:
             File model object or None on failure
         """
         self._ensure_initialized()
-        
+
         try:
-            file_item = self._files_class.insert_new_file(
+            file_item = await _owui_call(self._files_class.insert_new_file(
                 user_id,
                 self._file_form_class(
                     **{
@@ -518,7 +552,7 @@ class _OpenWebUIBridge:
                         },
                     }
                 ),
-            )
+            ))
             return file_item
         except Exception:
             raise StorageError(
@@ -526,12 +560,12 @@ class _OpenWebUIBridge:
                 "Failed to insert file into Open WebUI",
                 {"file_id": file_id}
             )
-    
-    def get_file_by_id(self, file_id: str) -> Any:
+
+    async def get_file_by_id(self, file_id: str) -> Any:
         """Get file metadata by ID."""
         self._ensure_initialized()
         try:
-            return self._files_class.get_file_by_id(file_id)
+            return await _owui_call(self._files_class.get_file_by_id(file_id))
         except Exception:
             raise StorageError(
                 "OPENWEBUI_GET_ERROR",
@@ -539,18 +573,43 @@ class _OpenWebUIBridge:
                 {"file_id": file_id}
             )
 
-    def delete_file_by_id(self, file_id: str) -> Any:
+    async def get_files_by_user_id(self, user_id: str) -> Any:
+        """List all files owned by a user."""
+        self._ensure_initialized()
+        try:
+            return await _owui_call(self._files_class.get_files_by_user_id(user_id))
+        except Exception:
+            raise StorageError(
+                "OPENWEBUI_LIST_ERROR",
+                "Failed to list files from Open WebUI",
+                {"user_id": user_id}
+            )
+
+    async def delete_file_by_id(self, file_id: str) -> Any:
         """Delete a file by ID."""
         self._ensure_initialized()
         try:
-            return self._files_class.delete_file_by_id(file_id)
+            return await _owui_call(self._files_class.delete_file_by_id(file_id))
         except Exception:
             raise StorageError(
                 "OPENWEBUI_DELETE_ERROR",
                 "Failed to delete file from Open WebUI",
                 {"file_id": file_id}
             )
-    
+
+    def get_uploads_dir(self) -> Path:
+        """
+        Resolve Open WebUI's uploads directory.
+
+        Docker images use /app/backend/data/uploads, but pip installs put it
+        under DATA_DIR (~/.open-webui by default), so ask Open WebUI first.
+        """
+        try:
+            from open_webui.config import UPLOAD_DIR
+            return Path(str(UPLOAD_DIR))
+        except Exception:
+            return Path("/app/backend/data/uploads")
+
     @classmethod
     def is_available(cls) -> bool:
         """Check if Open WebUI internal API is available."""
@@ -1916,7 +1975,7 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                 return "unknown"  # Contains control characters
         return conv_id if conv_id else "unknown"
 
-    def _resolve_zone(
+    async def _resolve_zone(
         self,
         zone: str,
         group: Optional[str],
@@ -2010,8 +2069,8 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                     "Use: shed_xxx(zone='group', group='team-name', ...)"
                 )
             
-            group_id = self._validate_group_id(group)
-            self._check_group_access(__user__, group_id)
+            group_id = await self._validate_group_id(group)
+            await self._check_group_access(__user__, group_id)
             zone_path = self._ensure_group_space(group_id)
             
             return ZoneContext(
@@ -2154,7 +2213,7 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
 
         return cleaned_path
 
-    def _validate_group_id(self, group_id: str) -> str:
+    async def _validate_group_id(self, group_id: str) -> str:
         """
         Validates and resolves a group identifier.
         Accepts either a group ID (UUID) or a group name (case-sensitive).
@@ -2193,7 +2252,7 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
         if GROUPS_AVAILABLE:
             try:
                 # Search for group by name
-                groups = Groups.get_all_groups()
+                groups = await _owui_call(Groups.get_all_groups()) or []
                 case_insensitive_matches = []
                 
                 for g in groups:
@@ -3469,21 +3528,21 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
                 except Exception:
                     pass
 
-    def _get_user_groups(self, user_id: str) -> list:
+    async def _get_user_groups(self, user_id: str) -> list:
         """Get groups the user belongs to via Open WebUI API."""
         if not GROUPS_AVAILABLE:
             return []
         try:
-            return Groups.get_groups_by_member_id(user_id)
+            return await _owui_call(Groups.get_groups_by_member_id(user_id)) or []
         except Exception:
             return []
 
-    def _is_group_member(self, user_id: str, group_id: str) -> bool:
+    async def _is_group_member(self, user_id: str, group_id: str) -> bool:
         """Check if user is member of group."""
-        user_groups = self._get_user_groups(user_id)
+        user_groups = await self._get_user_groups(user_id)
         return any(g.id == group_id for g in user_groups)
 
-    def _check_group_access(self, __user__: dict, group_id: str) -> None:
+    async def _check_group_access(self, __user__: dict, group_id: str) -> None:
         """Verify user has access to group. Raises error if not."""
         if not GROUPS_AVAILABLE:
             raise StorageError(
@@ -3493,7 +3552,7 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
             )
 
         # Check if group exists first
-        group_obj = Groups.get_group_by_id(group_id)
+        group_obj = await _owui_call(Groups.get_group_by_id(group_id))
         if group_obj is None:
             raise StorageError(
                 "GROUP_NOT_FOUND",
@@ -3505,7 +3564,7 @@ shed_exec(zone="storage", cmd="some_cmd", args=["..."],
         if __user__ is None:
             __user__ = {}
         user_id = __user__.get("id", "")
-        if not self._is_group_member(user_id, group_id):
+        if not await self._is_group_member(user_id, group_id):
             raise StorageError(
                 "GROUP_ACCESS_DENIED",
                 f"You are not a member of group '{group_id}'",
@@ -4052,8 +4111,8 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
         elif zone_lower == "group":
             if not group:
                 raise StorageError("MISSING_PARAMETER", "Group parameter required")
-            group_id = self._validate_group_id(group)
-            self._check_group_access(__user__, group_id)
+            group_id = await self._validate_group_id(group)
+            await self._check_group_access(__user__, group_id)
             zone_root = self._ensure_group_space(group_id)
             editzone_base = self._get_groups_root() / group_id
             git_commit = True
@@ -4462,8 +4521,8 @@ Note: stdout/stderr are truncated at 50KB to prevent context overflow.
         elif zone_lower == "group":
             if not group:
                 raise StorageError("MISSING_PARAMETER", "Group parameter required")
-            group_id = self._validate_group_id(group)
-            self._check_group_access(__user__, group_id)
+            group_id = await self._validate_group_id(group)
+            await self._check_group_access(__user__, group_id)
             zone_root = self._ensure_group_space(group_id)
             editzone_base = self._get_groups_root() / group_id
             git_commit = True
@@ -4901,7 +4960,7 @@ class Tools:
         """
         try:
             args = args or []  # Handle None default
-            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__)
+            ctx = await self._core._resolve_zone(zone, group, __user__, __metadata__)
 
             # Validate command against zone whitelist
             self._core._validate_command(cmd, ctx.whitelist, args)
@@ -5257,7 +5316,7 @@ class Tools:
                 dek = self._core._get_user_dek(user_id, encryption_key)
 
             # Resolve zone
-            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__)
+            ctx = await self._core._resolve_zone(zone, group, __user__, __metadata__)
 
             # Validate and resolve path
             path = self._core._validate_relative_path(path, ctx.zone_name, allow_zone_in_path)
@@ -5359,7 +5418,7 @@ class Tools:
                 )
 
             # Resolve zone
-            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__)
+            ctx = await self._core._resolve_zone(zone, group, __user__, __metadata__)
 
             # Validate and resolve path
             path = self._core._validate_relative_path(path, ctx.zone_name, allow_zone_in_path)
@@ -5457,7 +5516,7 @@ class Tools:
             if __user__ is None:
                 __user__ = {}
             # uploads allows delete even though readonly for other ops
-            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=False)
+            ctx = await self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=False)
 
             # Check for empty path first
             if not path or path.strip() == "":
@@ -5554,7 +5613,7 @@ class Tools:
             if not new_path or new_path.strip() == "":
                 raise StorageError("MISSING_PARAMETER", "new_path parameter is required")
 
-            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=True)
+            ctx = await self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=True)
 
             old_path = self._core._validate_relative_path(old_path, ctx.zone_name, allow_zone_in_path)
             new_path = self._core._validate_relative_path(new_path, ctx.zone_name, allow_zone_in_path)
@@ -5653,7 +5712,7 @@ class Tools:
                     hint="Specify the file to edit: shed_lockedit_open(zone, path)"
                 )
 
-            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=True)
+            ctx = await self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=True)
 
             path = self._core._validate_relative_path(path, ctx.zone_name, allow_zone_in_path)
             target = self._core._resolve_chroot_path(ctx.zone_root, path)
@@ -5746,7 +5805,7 @@ class Tools:
             if __user__ is None:
                 __user__ = {}
             args = args or []  # Handle None default
-            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=True)
+            ctx = await self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=True)
 
             # Validate path parameter
             if not path or not path.strip():
@@ -5829,7 +5888,7 @@ class Tools:
         try:
             if __user__ is None:
                 __user__ = {}
-            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=True)
+            ctx = await self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=True)
 
             # Validate path parameter
             if not path or not path.strip():
@@ -5912,7 +5971,7 @@ class Tools:
         try:
             if __user__ is None:
                 __user__ = {}
-            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=True)
+            ctx = await self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=True)
 
             # Validate path parameter
             if not path or not path.strip():
@@ -5999,7 +6058,7 @@ class Tools:
         try:
             if __user__ is None:
                 __user__ = {}
-            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=True)
+            ctx = await self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=True)
 
             # Validate path parameter
             if not path or not path.strip():
@@ -6454,13 +6513,29 @@ class Tools:
             imported = []
             errors = []
             
-            # Possible paths for Open WebUI files
-            owui_upload_paths = [
+            # Possible paths for Open WebUI files.
+            # The resolved UPLOAD_DIR comes first: Docker images use
+            # /app/backend/data, but pip installs use DATA_DIR instead.
+            owui_upload_paths = []
+            try:
+                resolved_uploads = _OpenWebUIBridge().get_uploads_dir()
+                owui_upload_paths.append(resolved_uploads)
+                data_dir = resolved_uploads.parent
+                owui_upload_paths.extend([
+                    data_dir / "files",
+                    data_dir / "cache" / "files",
+                    data_dir / "cache" / "uploads",
+                ])
+            except Exception:
+                pass
+            for fallback in (
                 Path("/app/backend/data/uploads"),
                 Path("/app/backend/data/files"),
                 Path("/app/backend/data/cache/files"),
                 Path("/app/backend/data/cache/uploads"),
-            ]
+            ):
+                if fallback not in owui_upload_paths:
+                    owui_upload_paths.append(fallback)
             
             for file_info in files:
                 try:
@@ -7015,7 +7090,7 @@ class Tools:
         """
         try:
             # Resolve zone using standard helper
-            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=False)
+            ctx = await self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=False)
             zone_root = ctx.zone_root
             zone_name = ctx.zone_name
 
@@ -7119,7 +7194,7 @@ class Tools:
         """
         try:
             # Resolve zone using standard helper
-            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=False)
+            ctx = await self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=False)
             zone_root = ctx.zone_root
             zone_name = ctx.zone_name
 
@@ -7223,7 +7298,7 @@ class Tools:
         """
         try:
             # Resolve zone using standard helper
-            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=False)
+            ctx = await self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=False)
             zone_root = ctx.zone_root
             zone_name = ctx.zone_name
 
@@ -7339,7 +7414,7 @@ class Tools:
         """
         try:
             # Resolve zone using standard helper (require_write=True rejects uploads)
-            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=True)
+            ctx = await self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=True)
             zone_root = ctx.zone_root
             zone_name = ctx.zone_name
 
@@ -7462,7 +7537,7 @@ class Tools:
         """
         try:
             # Resolve zone using standard helper
-            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=False)
+            ctx = await self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=False)
             zone_root = ctx.zone_root
             zone_name = ctx.zone_name
 
@@ -7674,7 +7749,7 @@ class Tools:
         """
         try:
             # Use centralized zone resolution
-            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=False)
+            ctx = await self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=False)
             zone_root = ctx.zone_root
             zone_name = ctx.zone_name
             readonly = ctx.readonly
@@ -8377,7 +8452,7 @@ class Tools:
                 __user__ = {}
 
             # Resolve zone using standard helper
-            ctx = self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=False)
+            ctx = await self._core._resolve_zone(zone, group, __user__, __metadata__, require_write=False)
             zone_root = ctx.zone_root
             zone_name = ctx.zone_name
 
@@ -8424,15 +8499,15 @@ class Tools:
                 content_type = "application/octet-stream"
             
             # Copy file to Open WebUI uploads directory
-            uploads_dir = Path("/app/backend/data/uploads")
+            bridge = _OpenWebUIBridge()
+            uploads_dir = bridge.get_uploads_dir()
             uploads_dir.mkdir(parents=True, exist_ok=True)
             dest_path = uploads_dir / f"{file_id}_{filename}"
             shutil.copy2(filepath, dest_path)
-            
+
             try:
                 # Create database entry using Bridge (isolates Open WebUI API changes)
-                bridge = _OpenWebUIBridge()
-                file_item = bridge.insert_file(
+                file_item = await bridge.insert_file(
                     user_id=user_id,
                     file_id=file_id,
                     filename=filename,
@@ -8442,15 +8517,28 @@ class Tools:
                     metadata={"fileshed_link": True, "source_zone": zone, "source_path": path}
                 )
                 
-                if not file_item:
+                if not file_item or not getattr(file_item, "id", None):
                     # Clean up copied file on failure
                     dest_path.unlink(missing_ok=True)
                     raise StorageError(
                         "DB_ERROR",
                         "Failed to create file entry in database",
-                        {"file_id": file_id}
+                        {"file_id": file_id},
+                        "Check Open WebUI version compatibility and server logs"
                     )
-                
+
+                # Read the entry back: a link pointing at a row that is not
+                # actually committed would 404 at download time with a
+                # misleading "We could not find what you're looking for :/"
+                if not await bridge.get_file_by_id(file_id):
+                    dest_path.unlink(missing_ok=True)
+                    raise StorageError(
+                        "DB_ERROR",
+                        "File entry was not persisted in database",
+                        {"file_id": file_id},
+                        "Check Open WebUI version compatibility and server logs"
+                    )
+
                 # Build download URL (full URL with base from valve)
                 base_url = self.valves.openwebui_api_url.rstrip('/')
                 download_url = f"{base_url}/api/v1/files/{file_id}/content"
@@ -8516,11 +8604,10 @@ class Tools:
             
             # Use Bridge to get user's files
             bridge = _OpenWebUIBridge()
-            bridge._ensure_initialized()
-            
+
             # Get files using the internal API
-            all_files = bridge._files_class.get_files_by_user_id(user_id)
-            
+            all_files = await bridge.get_files_by_user_id(user_id)
+
             # Filter only files created by Fileshed (have fileshed_link marker)
             files = []
             if all_files:
@@ -8610,7 +8697,7 @@ class Tools:
             
             # Use Bridge to get and verify file ownership
             bridge = _OpenWebUIBridge()
-            file_item = bridge.get_file_by_id(file_id)
+            file_item = await bridge.get_file_by_id(file_id)
             
             if not file_item:
                 raise StorageError(
@@ -8648,7 +8735,7 @@ class Tools:
             filename = file_item.filename
             
             # Delete from database
-            bridge.delete_file_by_id(file_id)
+            await bridge.delete_file_by_id(file_id)
             
             # Delete physical file if it exists
             if file_path:
@@ -8921,6 +9008,8 @@ shed_tree(zone="storage") # Directory tree
                 "network_enabled": self.valves.network_mode != "disabled",
                 "network_upload_allowed": self.valves.network_mode == "all",
                 "groups_available": GROUPS_AVAILABLE,
+                "openwebui_version": _OpenWebUIBridge.get_api_version(),
+                "openwebui_files_api_available": _OpenWebUIBridge.is_available(),
             }
             
             return self._core._format_response(True, data=params, message="Current valve configuration")
@@ -9039,8 +9128,8 @@ shed_tree(zone="storage") # Directory tree
             # Determine if group or personal zone
             if group:
                 # Group mode
-                group = self._core._validate_group_id(group)
-                self._core._check_group_access(__user__, group)
+                group = await self._core._validate_group_id(group)
+                await self._core._check_group_access(__user__, group)
                 zone_name = f"Group:{group}"
 
                 # Validate path with zone_name
@@ -9186,7 +9275,7 @@ shed_tree(zone="storage") # Directory tree
             
             # Clean group zones (for groups the user belongs to)
             user_id = __user__.get("id", "")
-            user_groups = self._core._get_user_groups(user_id)
+            user_groups = await self._core._get_user_groups(user_id)
             groups_root = self._core._get_groups_root()
             
             for group in user_groups:
@@ -9613,14 +9702,14 @@ shed_tree(zone="storage") # Directory tree
                 )
 
             user_id = __user__.get("id", "")
-            groups = self._core._get_user_groups(user_id)
+            groups = await self._core._get_user_groups(user_id)
             
             result = []
             for g in groups:
                 # Use dedicated API method to get member count
                 member_count = 0
                 try:
-                    member_count = Groups.get_group_member_count_by_id(g.id) or 0
+                    member_count = await _owui_call(Groups.get_group_member_count_by_id(g.id)) or 0
                 except Exception:
                     pass
                 
@@ -9655,13 +9744,13 @@ shed_tree(zone="storage") # Directory tree
         """
         try:
             # Validate group_id
-            group = self._core._validate_group_id(group)
-            self._core._check_group_access(__user__, group)
+            group = await self._core._validate_group_id(group)
+            await self._core._check_group_access(__user__, group)
             
             # Get group info and member list using dedicated API methods
-            group_obj = Groups.get_group_by_id(group)
+            group_obj = await _owui_call(Groups.get_group_by_id(group))
             try:
-                member_ids = Groups.get_group_user_ids_by_id(group) or []
+                member_ids = await _owui_call(Groups.get_group_user_ids_by_id(group)) or []
             except Exception:
                 member_ids = []
             
@@ -9752,8 +9841,8 @@ shed_tree(zone="storage") # Directory tree
             if __user__ is None:
                 __user__ = {}
             # Validate group_id
-            group = self._core._validate_group_id(group)
-            self._core._check_group_access(__user__, group)
+            group = await self._core._validate_group_id(group)
+            await self._core._check_group_access(__user__, group)
             user_id = __user__.get("id", "")
             zone_name = f"Group:{group}"
 
@@ -9815,8 +9904,8 @@ shed_tree(zone="storage") # Directory tree
             if __user__ is None:
                 __user__ = {}
             # Validate group_id
-            group = self._core._validate_group_id(group)
-            self._core._check_group_access(__user__, group)
+            group = await self._core._validate_group_id(group)
+            await self._core._check_group_access(__user__, group)
             user_id = __user__.get("id", "")
             zone_name = f"Group:{group}"
 
@@ -9846,7 +9935,7 @@ shed_tree(zone="storage") # Directory tree
                 )
 
             # Check new owner is group member
-            if not self._core._is_group_member(new_owner, group):
+            if not await self._core._is_group_member(new_owner, group):
                 raise StorageError(
                     "INVALID_OWNER",
                     f"User '{new_owner}' is not a member of this group"
@@ -9903,8 +9992,8 @@ shed_tree(zone="storage") # Directory tree
             if __metadata__ is None:
                 __metadata__ = {}
             # Validate group_id
-            group = self._core._validate_group_id(group)
-            self._core._check_group_access(__user__, group)
+            group = await self._core._validate_group_id(group)
+            await self._core._check_group_access(__user__, group)
             user_id = __user__.get("id", "")
             conv_id = self._core._get_conv_id(__metadata__)
 
